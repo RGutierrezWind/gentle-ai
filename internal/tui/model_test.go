@@ -2385,7 +2385,13 @@ func TestModelConfigOpenCodeReloadsBaseAssignmentsAfterProfileEdit(t *testing.T)
 	m.Screen = ScreenModelConfig
 	m.Cursor = 1
 	m.ProfileEditMode = true
-	m.ProfileDraft = model.Profile{Name: "work"}
+	m.ProfileDraft = model.Profile{
+		Name:              "work",
+		OrchestratorModel: model.ModelAssignment{ProviderID: "profile-provider", ModelID: "profile-orchestrator"},
+		PhaseAssignments: map[string]model.ModelAssignment{
+			"sdd-apply": {ProviderID: "profile-provider", ModelID: "profile-apply"},
+		},
+	}
 	m.Selection.ModelAssignments = map[string]model.ModelAssignment{
 		screens.SDDOrchestratorPhase: {ProviderID: "profile-provider", ModelID: "profile-orchestrator"},
 		"sdd-apply":                  {ProviderID: "profile-provider", ModelID: "profile-apply"},
@@ -2394,6 +2400,12 @@ func TestModelConfigOpenCodeReloadsBaseAssignmentsAfterProfileEdit(t *testing.T)
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	state := updated.(Model)
 
+	if state.ProfileEditMode {
+		t.Fatal("profile edit mode was not cleared")
+	}
+	if !reflect.DeepEqual(state.ProfileDraft, model.Profile{}) {
+		t.Fatalf("profile draft was not cleared: %+v", state.ProfileDraft)
+	}
 	if got := state.Selection.ModelAssignments[screens.SDDOrchestratorPhase].ProviderID; got != "anthropic" {
 		t.Fatalf("orchestrator provider = %q, want base OpenCode assignment", got)
 	}
