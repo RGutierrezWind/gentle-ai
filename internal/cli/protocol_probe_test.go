@@ -21,7 +21,20 @@ import (
 // invocations exactly — see the exact-argv assertions in
 // run_integration_test.go).
 func TestMain(m *testing.M) {
+	if code, ok := reviewGitProcessHelperExitCode(); ok {
+		os.Exit(code)
+	}
 	if err := os.Unsetenv("GENTLE_AI_CHANNEL"); err != nil {
+		panic(err)
+	}
+	testHome, err := os.MkdirTemp("", "gentle-ai-cli-test-home-*")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("HOME", testHome); err != nil {
+		panic(err)
+	}
+	if err := os.Setenv("USERPROFILE", testHome); err != nil {
 		panic(err)
 	}
 
@@ -32,5 +45,7 @@ func TestMain(m *testing.M) {
 		return "", errors.New("engram setup --help not available in tests")
 	}
 
-	os.Exit(m.Run())
+	code := m.Run()
+	_ = os.RemoveAll(testHome)
+	os.Exit(code)
 }

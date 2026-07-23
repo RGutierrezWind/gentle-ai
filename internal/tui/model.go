@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -114,6 +116,7 @@ var readCurrentAssignmentsFn = func(settingsPath string) (map[string]model.Model
 var readProfilesFn = func(settingsPath string) ([]model.Profile, error) {
 	return sdd.DetectProfiles(settingsPath)
 }
+var removeProfileAgentsFn = sdd.RemoveProfileAgents
 
 func sanitizeKnownModelEfforts(assignments map[string]model.ModelAssignment, sddModels map[string][]opencode.Model) map[string]model.ModelAssignment {
 	if assignments == nil {
@@ -291,6 +294,14 @@ type OpenCodePluginRegistrationDoneMsg struct {
 	Err     error
 }
 
+// OpenCodePluginUninstallDoneMsg is sent when the async uninstall runner
+// returns. Result holds the partial 4-layer report and Err is non-nil on
+// failure (with the partial result still populated when available).
+type OpenCodePluginUninstallDoneMsg struct {
+	Result opencodeplugin.UninstallResult
+	Err    error
+}
+
 type CommunityToolInstallationDoneMsg struct {
 	Results []communitytool.Result
 	Err     error
@@ -412,6 +423,16 @@ const (
 	// at launch. No snooze or skip state is persisted — shown on every launch with
 	// a pending update. Keys: u=update+quit, c/Enter=keep→Welcome, v=view changes.
 	ScreenUpdatePrompt
+	// ScreenOpenCodePluginUninstall is the standalone launcher for the
+	// uninstall flow. Shows a list of installed OpenCode community plugins
+	// and lets the user pick one to remove.
+	ScreenOpenCodePluginUninstall
+	// ScreenOpenCodePluginUninstallConfirm shows the layered-cleanup
+	// preview and runs the async 4-layer uninstall when Enter is pressed.
+	ScreenOpenCodePluginUninstallConfirm
+	// ScreenOpenCodePluginUninstallResult reports the success/failure
+	// summary of the uninstall and returns to Welcome on Enter.
+	ScreenOpenCodePluginUninstallResult
 )
 
 type Model struct {
@@ -601,6 +622,36 @@ type Model struct {
 	OpenCodePluginRegistrationResults []opencodeplugin.Result
 	OpenCodePluginRegistrationErr     error
 
+	// OpenCodePluginUninstallFn is the async uninstall runner. Returns a
+	// result and error from the 4-layer engine. Defaults to
+	// opencodeplugin.Uninstall if nil.
+	OpenCodePluginUninstallFn func(homeDir string, id model.OpenCodeCommunityPluginID) (opencodeplugin.UninstallResult, error)
+
+	// OpenCodePluginUninstallStandalone mirrors OpenCodePluginsStandalone
+	// for the uninstall flow — true when reached via the Welcome shortcut
+	// instead of an install-then-uninstall chain.
+	OpenCodePluginUninstallStandalone bool
+
+	// OpenCodePluginUninstallInstalled lists the plugins currently installed
+	// (filled by the standalone launcher from tui.json's plugin[] list).
+	// Used by the Select screen to know what to offer.
+	OpenCodePluginUninstallInstalled []model.OpenCodeCommunityPluginID
+
+	// OpenCodePluginUninstallSelected is the currently highlighted plugin id
+	// in the Select screen (cursor position maps to this).
+	OpenCodePluginUninstallSelected model.OpenCodeCommunityPluginID
+
+	// OpenCodePluginUninstallResult + Err hold the dedicated uninstall result.
+	OpenCodePluginUninstallResult opencodeplugin.UninstallResult
+	// OpenCodePluginUninstallErr is the error from the async uninstall runner,
+	// or nil on success. Populated alongside OpenCodePluginUninstallResult when
+	// the OpenCodePluginUninstallDoneMsg arrives.
+	OpenCodePluginUninstallErr error
+
+	// OpenCodePluginUninstallSpinnerFrame drives the spinner during the
+	// running state of the Confirm screen.
+	OpenCodePluginUninstallSpinnerFrame int
+
 	CommunityToolsStandalone   bool
 	CommunityToolStatusLoading bool
 	CommunityToolStatuses      []communitytool.Status
@@ -765,6 +816,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.SpinnerFrame = (m.SpinnerFrame + 1) % 10
 			return m, tickCmd()
 		}
+		// Keep the dedicated uninstall spinner running while the Confirm screen is
+		// in flight so the spinner frame can be advanced independently of the
+		// global SpinnerFrame. Checked first because OperationRunning is true
+		// during the uninstall and would otherwise short-circuit into the
+		// global SpinnerFrame branch.
+		if m.Screen == ScreenOpenCodePluginUninstallConfirm && m.OperationRunning {
+			m = m.spinnerTickOpenCodePluginUninstall()
+			return m, tickCmd()
+		}
 		// Keep spinner running for operation screens.
 		if m.OperationRunning || (m.Screen == ScreenUpgrade && !m.UpdateCheckDone) ||
 			(m.Screen == ScreenUpgradeSync && !m.UpdateCheckDone) {
@@ -820,12 +880,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case OpenCodePluginRegistrationDoneMsg:
+		if m.Screen != ScreenOpenCodePlugins {
+			return m, nil
+		}
 		m.OperationRunning = false
 		m.OpenCodePluginRegistrationResults = msg.Results
 		m.OpenCodePluginRegistrationErr = msg.Err
 		m.setScreen(ScreenOpenCodePluginResult)
 		return m, nil
+	case OpenCodePluginUninstallDoneMsg:
+		if m.Screen != ScreenOpenCodePluginUninstallConfirm {
+			return m, nil
+		}
+		m.OperationRunning = false
+		m.OpenCodePluginUninstallResult = msg.Result
+		m.OpenCodePluginUninstallErr = msg.Err
+		m.setScreen(ScreenOpenCodePluginUninstallResult)
+		return m, nil
 	case CommunityToolInstallationDoneMsg:
+		if m.Screen != ScreenCommunityToolInstalling {
+			return m, nil
+		}
 		m.OperationRunning = false
 		m.CommunityToolResults = msg.Results
 		m.CommunityToolErr = msg.Err
@@ -842,6 +917,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case PipelineDoneMsg:
 		return m.handlePipelineDone(msg)
 	case BackupRestoreMsg:
+		if m.Screen != ScreenRestoreConfirm {
+			return m, nil
+		}
 		return m.handleBackupRestore(msg)
 	case UpdateCheckResultMsg:
 		m.UpdateResults = msg.Results
@@ -863,6 +941,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.AdvisoryScroll = 0
 		return m, nil
 	case UpgradeDoneMsg:
+		if m.Screen != ScreenUpgrade && m.Screen != ScreenUpdatePrompt {
+			return m, nil
+		}
 		m.OperationRunning = false
 		m.UpgradeErr = msg.Err
 		if msg.Err == nil {
@@ -876,6 +957,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.UpdateCheckDone = false
 		return m, m.Init()
 	case SyncDoneMsg:
+		if m.Screen != ScreenSync && m.Screen != ScreenUpgradeSync && m.Screen != ScreenProfiles {
+			return m, nil
+		}
 		m.OperationRunning = false
 		m.SyncFiles = msg.Files
 		m.SyncErr = msg.Err
@@ -897,6 +981,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} // else keep existing list
 		return m, nil
 	case UninstallDoneMsg:
+		if m.Screen != ScreenUninstallConfirm {
+			return m, nil
+		}
 		m.OperationRunning = false
 		m.UninstallResult = msg.Result
 		m.UninstallErr = msg.Err
@@ -905,6 +992,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setScreen(ScreenUninstallResult)
 		return m, nil
 	case UpgradePhaseCompletedMsg:
+		if m.Screen != ScreenUpgradeSync {
+			return m, nil
+		}
 		// Upgrade phase done; sync phase is about to start (OperationRunning stays true).
 		m.UpgradeErr = msg.Err
 		if msg.Err == nil {
@@ -1006,6 +1096,7 @@ func (m Model) handlePipelineDone(msg PipelineDoneMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleBackupRestore(msg BackupRestoreMsg) (tea.Model, tea.Cmd) {
+	m.OperationRunning = false
 	m.RestoreErr = msg.Err
 	// Navigate to the result screen regardless of success or failure.
 	// The result screen shows success or the error message.
@@ -1090,9 +1181,18 @@ func (m Model) View() string {
 	case ScreenStrictTDD:
 		return screens.RenderStrictTDD(m.Selection.StrictTDD, m.Cursor)
 	case ScreenOpenCodePlugins:
+		if m.OperationRunning {
+			return screens.RenderOperationRunning("Installing OpenCode Plugins", "Registering selected plugins...", m.SpinnerFrame)
+		}
 		return screens.RenderOpenCodePlugins(m.Selection.OpenCodePlugins, m.Cursor)
 	case ScreenOpenCodePluginResult:
 		return screens.RenderOpenCodePluginResult(m.OpenCodePluginRegistrationResults, m.OpenCodePluginRegistrationErr)
+	case ScreenOpenCodePluginUninstall:
+		return screens.RenderOpenCodePluginUninstallSelect(m.OpenCodePluginUninstallInstalled, m.Cursor)
+	case ScreenOpenCodePluginUninstallConfirm:
+		return screens.RenderOpenCodePluginUninstallConfirm(m.OpenCodePluginUninstallSelected, m.OperationRunning, m.OpenCodePluginUninstallSpinnerFrame)
+	case ScreenOpenCodePluginUninstallResult:
+		return screens.RenderOpenCodePluginUninstallResult(m.OpenCodePluginUninstallResult, m.OpenCodePluginUninstallErr)
 	case ScreenCommunityTools:
 		return screens.RenderCommunityTools(m.Selection.CommunityTools, m.Cursor, m.CommunityToolStatuses, m.CommunityToolStatusLoading, m.CommunityToolStatusErr)
 	case ScreenCommunityToolInstalling:
@@ -1104,7 +1204,7 @@ func (m Model) View() string {
 	case ScreenDependencyTree:
 		return screens.RenderDependencyTree(m.DependencyPlan, m.Selection, m.Cursor)
 	case ScreenSkillPicker:
-		return screens.RenderSkillPicker(m.SkillPicker, m.Cursor)
+		return screens.RenderSkillPicker(m.SkillPicker, m.Cursor, m.Height)
 	case ScreenReview:
 		return screens.RenderReview(m.Review, m.Cursor)
 	case ScreenInstalling:
@@ -1124,6 +1224,9 @@ func (m Model) View() string {
 	case ScreenBackups:
 		return screens.RenderBackups(m.Backups, m.Cursor, m.BackupScroll, m.PinErr)
 	case ScreenRestoreConfirm:
+		if m.OperationRunning {
+			return screens.RenderOperationRunning("Restoring Backup", "Applying backup...", m.SpinnerFrame)
+		}
 		return screens.RenderRestoreConfirm(m.SelectedBackup, m.Cursor)
 	case ScreenRestoreResult:
 		return screens.RenderRestoreResult(m.SelectedBackup, m.RestoreErr)
@@ -1143,7 +1246,7 @@ func (m Model) View() string {
 		return screens.RenderABSDDPhase(screens.ABSDDPhases(), m.Cursor, m.AgentBuilder.SDDMode == agentbuilder.SDDNewPhase)
 	case ScreenAgentBuilderGenerating:
 		engineName := string(m.AgentBuilder.SelectedEngine)
-		return screens.RenderABGenerating(engineName, m.SpinnerFrame, m.AgentBuilder.GenerationErr)
+		return screens.RenderABGenerating(engineName, m.SpinnerFrame, m.AgentBuilder.GenerationErr, m.Cursor)
 	case ScreenAgentBuilderPreview:
 		targets := m.agentBuilderInstallTargets()
 		return screens.RenderABPreview(m.AgentBuilder.Generated, targets, m.AgentBuilder.PreviewScroll, m.Height, m.Cursor, m.AgentBuilder.InstallErr, m.AgentBuilder.ConflictWarning)
@@ -1227,7 +1330,7 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		wasInCustomMode := m.KiroModelPicker.InCustomMode
 		handled, updated := screens.HandleKiroModelPickerNav(keyStr, &m.KiroModelPicker, m.Cursor)
 		if handled {
-			if wasInCustomMode && !m.KiroModelPicker.InCustomMode {
+			if wasInCustomMode != m.KiroModelPicker.InCustomMode {
 				m.Cursor = 0
 			}
 			if updated != nil {
@@ -1249,11 +1352,10 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.Screen == ScreenCodexModelPicker {
-		wasInCustomSubMode := m.CodexModelPicker.CustomMode != screens.CodexCustomModeNone
+		previousMode := m.CodexModelPicker.CustomMode
 		handled, assignments := screens.HandleCodexModelPickerNav(keyStr, &m.CodexModelPicker, m.Cursor)
 		if handled {
-			// Reset cursor when exiting the Custom sub-mode back to the main picker.
-			if wasInCustomSubMode && m.CodexModelPicker.CustomMode == screens.CodexCustomModeNone {
+			if previousMode != m.CodexModelPicker.CustomMode {
 				m.Cursor = 0
 			}
 			if assignments != nil {
@@ -1319,6 +1421,9 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// here so the generic enter/esc/up/down logic is bypassed for this screen.
 	if m.Screen == ScreenUpdatePrompt {
 		return m.handleUpdatePromptKey(keyStr)
+	}
+	if m.OperationRunning && keyStr != "q" && keyStr != "ctrl+c" {
+		return m, nil
 	}
 	if m.Screen == ScreenWelcome {
 		pageSize, maxScroll := screens.WelcomeAdvisoryScrollBounds(m.AdvisoryMessage, m.AdvisoryURL, m.Width, m.Height)
@@ -1497,6 +1602,7 @@ func (m Model) handleKeyPress(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		// Delete on ScreenProfiles: only non-default profiles (those in ProfileList).
 		if m.Screen == ScreenProfiles && m.Cursor < len(m.ProfileList) {
+			m.ProfileDeleteErr = nil
 			m.ProfileDeleteTarget = m.ProfileList[m.Cursor].Name
 			m.setScreen(ScreenProfileDelete)
 			return m, nil
@@ -1598,6 +1704,28 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			}
 			next++
 
+			// Slice 3b — standalone launcher for the 4-layer uninstall of
+			// OpenCode community plugins. Sits between the install
+			// shortcut (cursor=6) and the OpenCode Profiles entry
+			// (cursor=7 with detected OpenCode, cursor=8 without) so the
+			// menu pairs install + uninstall as mirror operations.
+			if m.Cursor == next {
+				m.OpenCodePluginUninstallStandalone = true
+				m.OpenCodePluginUninstallInstalled = openCodePluginUninstallInstalledFromTUI(homeDir())
+				m.OpenCodePluginUninstallResult = opencodeplugin.UninstallResult{}
+				m.OpenCodePluginUninstallErr = nil
+				m.OpenCodePluginUninstallSpinnerFrame = 0
+				// Empty tui.json (or no recognizable plugin entries) — skip
+				// the Select screen and surface the empty state on Result.
+				if len(m.OpenCodePluginUninstallInstalled) == 0 {
+					m.setScreen(ScreenOpenCodePluginUninstallResult)
+				} else {
+					m.setScreen(ScreenOpenCodePluginUninstall)
+				}
+				return m, nil
+			}
+			next++
+
 			if m.hasDetectedOpenCode() {
 				if m.Cursor == next {
 					m.setScreen(ScreenProfiles)
@@ -1677,7 +1805,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		case m.Cursor == agentCount && len(m.UninstallAgents) > 0:
 			m.setScreen(ScreenUninstallComponents)
 		case m.Cursor == agentCount+1:
-			m.setScreen(ScreenWelcome)
+			m.setScreen(ScreenUninstallMode)
 		}
 		return m, nil
 	case ScreenUninstallComponents:
@@ -1809,6 +1937,9 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			m.setScreen(ScreenWelcome)
 			return m, nil
 		}
+		if !m.UpdateCheckDone {
+			return m, nil
+		}
 		// Start upgrade+sync.
 		m.OperationRunning = true
 		m.OperationMode = "upgrade-sync"
@@ -1858,7 +1989,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 	case ScreenProfileDelete:
 		switch m.Cursor {
 		case 0: // "Delete & Sync"
-			if err := sdd.RemoveProfileAgents(opencode.DefaultSettingsPath(), m.ProfileDeleteTarget); err != nil {
+			if err := removeProfileAgentsFn(opencode.DefaultSettingsPath(), m.ProfileDeleteTarget); err != nil {
 				// Store the error so it can be displayed on ScreenProfiles.
 				m.ProfileDeleteErr = err
 				m.setScreen(ScreenProfiles)
@@ -1867,6 +1998,8 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 				m.PendingSyncOverrides = nil
 				m = m.withResetSyncState()
 				m.setScreen(ScreenSync)
+				m.OperationRunning = true
+				m.OperationMode = "sync"
 				return m, tea.Batch(tickCmd(), m.startSync(nil))
 			}
 		default: // "Cancel"
@@ -1955,10 +2088,9 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 			// truth. pickerNextScreen(ScreenPreset) returns the first chain member
 			// for the current selection (Claude → Kiro → Codex → SDDMode →
 			// ModelPicker → StrictTDD); applyPickerEntry initializes its state.
-			// DependencyTree is the slice's terminal anchor, not a "picker": when
-			// it is the only next member, no SDD/picker screen applies, so fall
-			// through to the OpenCodePlugins guard below.
-			if next, ok := m.pickerNextScreen(); ok && next != ScreenDependencyTree {
+			// DependencyTree is the initial component picker for Custom and the
+			// terminal anchor for every other preset.
+			if next, ok := m.pickerNextScreen(); ok && (next != ScreenDependencyTree || m.Selection.Preset == model.PresetCustom) {
 				m.applyPickerEntry(next)
 				return m, nil
 			}
@@ -2047,9 +2179,13 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		// When no providers are detected the screen offers Continue with defaults
 		// and Back. Handle that before the normal row logic.
 		if len(m.ModelPicker.AvailableIDs) == 0 {
-			if m.ModelConfigMode || m.Cursor == 1 {
+			if m.ModelConfigMode {
 				m.ModelConfigMode = false
 				m.setScreen(ScreenModelConfig)
+				return m, nil
+			}
+			if m.Cursor == 1 {
+				m.applyPickerEntry(ScreenSDDMode)
 				return m, nil
 			}
 			// Continue with OpenCode defaults when no providers are available yet.
@@ -2164,6 +2300,17 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 		m.Selection.OpenCodePlugins = nil
 		m.OpenCodePluginRegistrationResults = nil
 		m.OpenCodePluginRegistrationErr = nil
+		m.setScreen(ScreenWelcome)
+		return m, nil
+	case ScreenOpenCodePluginUninstall:
+		return m.confirmOpenCodePluginUninstallSelect()
+	case ScreenOpenCodePluginUninstallConfirm:
+		if m.OperationRunning {
+			return m, nil
+		}
+		return m.confirmOpenCodePluginUninstallConfirm()
+	case ScreenOpenCodePluginUninstallResult:
+		m.resetOpenCodePluginUninstallState()
 		m.setScreen(ScreenWelcome)
 		return m, nil
 	case ScreenCommunityTools:
@@ -2332,16 +2479,14 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 	case ScreenRestoreConfirm:
 		// Cursor 0 = "Restore", Cursor 1 = "Cancel".
 		if m.Cursor == 0 {
+			m.OperationRunning = true
 			return m.restoreBackup(m.SelectedBackup)
 		}
 		m.setScreen(ScreenBackups)
 	case ScreenRestoreResult:
 		// Enter on the result screen returns to backup selection.
 		// Refresh the backup list to reflect any changes from the restore.
-		if m.ListBackupsFn != nil {
-			m.Backups = m.ListBackupsFn()
-		}
-		m.setScreen(ScreenBackups)
+		m = m.finishBackupResult(false)
 	case ScreenDeleteConfirm:
 		// Cursor 0 = "Delete", Cursor 1 = "Cancel".
 		if m.Cursor == 0 {
@@ -2355,11 +2500,7 @@ func (m Model) confirmSelection() (tea.Model, tea.Cmd) {
 	case ScreenDeleteResult:
 		// Enter on the result screen returns to backup selection.
 		// Refresh the backup list to reflect any changes from the delete.
-		if m.ListBackupsFn != nil {
-			m.Backups = m.ListBackupsFn()
-		}
-		m.DeleteErr = nil
-		m.setScreen(ScreenBackups)
+		m = m.finishBackupResult(true)
 	case ScreenAgentBuilderEngine:
 		engines := m.AgentBuilder.AvailableEngines
 		if m.Cursor < len(engines) {
@@ -2563,6 +2704,9 @@ func (m Model) handleUpdatePromptKey(keyStr string) (tea.Model, tea.Cmd) {
 	switch keyStr {
 	case "ctrl+c", "q":
 		return m, tea.Quit
+	case "esc":
+		m.setScreen(ScreenWelcome)
+		return m, nil
 	case "up":
 		if m.Cursor > 0 {
 			m.Cursor--
@@ -2661,6 +2805,76 @@ func (m Model) startOpenCodePluginRegistration() tea.Cmd {
 		}
 		return OpenCodePluginRegistrationDoneMsg{Results: results}
 	}
+}
+
+// startOpenCodePluginUninstall launches the async uninstall runner and
+// returns a tea.Cmd that produces an OpenCodePluginUninstallDoneMsg when the
+// 4-layer engine finishes. When the injected OpenCodePluginUninstallFn is
+// nil it falls back to opencodeplugin.Uninstall so production callers do
+// not need to wire it themselves.
+func (m Model) startOpenCodePluginUninstall() tea.Cmd {
+	runner := m.OpenCodePluginUninstallFn
+	home := homeDir()
+	id := m.OpenCodePluginUninstallSelected
+	return func() tea.Msg {
+		if runner == nil {
+			result, err := opencodeplugin.Uninstall(home, id)
+			return OpenCodePluginUninstallDoneMsg{Result: result, Err: err}
+		}
+		result, err := runner(home, id)
+		return OpenCodePluginUninstallDoneMsg{Result: result, Err: err}
+	}
+}
+
+// confirmOpenCodePluginUninstallSelect handles Enter on the Select screen:
+// cursor on a plugin row selects it and advances to Confirm; cursor on the
+// trailing Back row returns to Welcome and resets the uninstall state.
+func (m Model) confirmOpenCodePluginUninstallSelect() (tea.Model, tea.Cmd) {
+	installed := m.OpenCodePluginUninstallInstalled
+	if m.Cursor < 0 {
+		return m, nil
+	}
+	if m.Cursor < len(installed) {
+		m.OpenCodePluginUninstallSelected = installed[m.Cursor]
+		m.setScreen(ScreenOpenCodePluginUninstallConfirm)
+		return m, nil
+	}
+	// Back row.
+	m.resetOpenCodePluginUninstallState()
+	m.setScreen(ScreenWelcome)
+	return m, nil
+}
+
+// resetOpenCodePluginUninstallState clears every uninstall-flow field so
+// re-entering the flow from Welcome starts fresh. Mirrors the install
+// flow's OpenCodePluginsStandalone reset pattern.
+func (m *Model) resetOpenCodePluginUninstallState() {
+	m.OpenCodePluginUninstallStandalone = false
+	m.OpenCodePluginUninstallInstalled = nil
+	m.OpenCodePluginUninstallSelected = ""
+	m.OpenCodePluginUninstallResult = opencodeplugin.UninstallResult{}
+	m.OpenCodePluginUninstallErr = nil
+	m.OpenCodePluginUninstallSpinnerFrame = 0
+}
+
+// confirmOpenCodePluginUninstallConfirm handles Enter on the Confirm screen:
+// kick off the async uninstall and stay on Confirm with the spinner running.
+func (m Model) confirmOpenCodePluginUninstallConfirm() (tea.Model, tea.Cmd) {
+	if m.OpenCodePluginUninstallSelected == "" {
+		return m, nil
+	}
+	m.OperationRunning = true
+	m.OpenCodePluginUninstallSpinnerFrame = 0
+	return m, tea.Batch(tickCmd(), m.startOpenCodePluginUninstall())
+}
+
+// spinnerTickOpenCodePluginUninstall advances the dedicated uninstall
+// spinner frame. Called from the TickMsg handler so the Confirm screen
+// has its own counter that survives other spinner users (community tools,
+// agent builder, etc.).
+func (m Model) spinnerTickOpenCodePluginUninstall() Model {
+	m.OpenCodePluginUninstallSpinnerFrame = (m.OpenCodePluginUninstallSpinnerFrame + 1) % 10
+	return m
 }
 
 func (m Model) startCommunityToolInstallation() tea.Cmd {
@@ -2918,6 +3132,7 @@ func (m Model) GentleAIUpgradeVersion() (string, bool) {
 // restoreBackup triggers a backup restore in a goroutine.
 func (m Model) restoreBackup(manifest backup.Manifest) (tea.Model, tea.Cmd) {
 	if m.RestoreFn == nil {
+		m.OperationRunning = false
 		m.Err = fmt.Errorf("restore not available")
 		return m, nil
 	}
@@ -2927,6 +3142,17 @@ func (m Model) restoreBackup(manifest backup.Manifest) (tea.Model, tea.Cmd) {
 		err := restoreFn(manifest)
 		return BackupRestoreMsg{Err: err}
 	}
+}
+
+func (m Model) finishBackupResult(clearDeleteError bool) Model {
+	if m.ListBackupsFn != nil {
+		m.Backups = m.ListBackupsFn()
+	}
+	if clearDeleteError {
+		m.DeleteErr = nil
+	}
+	m.setScreen(ScreenBackups)
+	return m
 }
 
 // buildProgressLabels creates step labels from the resolved plan that match
@@ -2970,12 +3196,50 @@ func (m Model) goBack() Model {
 		m.setScreen(ScreenWelcome)
 		return m
 	}
+	if m.Screen == ScreenRestoreResult || m.Screen == ScreenDeleteResult {
+		return m.finishBackupResult(m.Screen == ScreenDeleteResult)
+	}
+	if m.Screen == ScreenUninstallResult {
+		m = m.withResetUninstallState()
+		m.setScreen(ScreenWelcome)
+		return m
+	}
 
 	if m.Screen == ScreenOpenCodePluginResult {
 		m.OpenCodePluginsStandalone = false
 		m.Selection.OpenCodePlugins = nil
 		m.OpenCodePluginRegistrationResults = nil
 		m.OpenCodePluginRegistrationErr = nil
+		m.setScreen(ScreenWelcome)
+		return m
+	}
+
+	// Esc on the uninstall Select screen returns to Welcome and resets the
+	// uninstall state. Mirrors the install flow's goBackFromOpenCodePlugins
+	// reset on Esc from ScreenOpenCodePlugins.
+	if m.Screen == ScreenOpenCodePluginUninstall {
+		m.resetOpenCodePluginUninstallState()
+		m.setScreen(ScreenWelcome)
+		return m
+	}
+
+	// Esc on the uninstall Confirm screen cancels and returns to the Select
+	// screen. The OperationRunning guard above already prevents Esc from
+	// being processed while the 4-layer engine is mid-uninstall.
+	if m.Screen == ScreenOpenCodePluginUninstallConfirm {
+		m.setScreen(ScreenOpenCodePluginUninstall)
+		return m
+	}
+
+	// Esc on the uninstall Result screen returns to Welcome and clears the
+	// uninstall state. Mirrors the OpenCodePluginResult handling above.
+	if m.Screen == ScreenOpenCodePluginUninstallResult {
+		m.OpenCodePluginUninstallStandalone = false
+		m.OpenCodePluginUninstallInstalled = nil
+		m.OpenCodePluginUninstallSelected = ""
+		m.OpenCodePluginUninstallResult = opencodeplugin.UninstallResult{}
+		m.OpenCodePluginUninstallErr = nil
+		m.OpenCodePluginUninstallSpinnerFrame = 0
 		m.setScreen(ScreenWelcome)
 		return m
 	}
@@ -3216,14 +3480,13 @@ func (m *Model) setScreen(next Screen) {
 		m.PinErr = nil
 	}
 	if next == ScreenProfiles {
-		// Clear stale delete error so it is not shown after Cancel/Esc from ScreenProfileDelete.
-		m.ProfileDeleteErr = nil
-		// Refresh profile list on entry. Surface errors via m.Err so callers can react.
+		// Refresh on entry without replacing valid data with an empty error state.
 		profiles, err := readProfilesFn(opencode.DefaultSettingsPath())
 		if err != nil {
 			m.Err = err
-			m.ProfileList = nil
+			m.ProfileDeleteErr = err
 		} else {
+			m.Err = nil
 			m.ProfileList = profiles
 		}
 		// Clamp cursor so it never points past the end of a refreshed list.
@@ -3288,20 +3551,29 @@ func (m Model) handleRenameInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) optionCount() int {
+	if m.OperationRunning {
+		return 0
+	}
 	switch m.Screen {
 	case ScreenWelcome:
 		return len(screens.WelcomeOptions(m.UpdateResults, m.UpdateCheckDone, m.hasDetectedOpenCode(), len(m.ProfileList), m.hasAgentBuilderEngines()))
 	case ScreenUpgrade:
 		if m.UpgradeReport != nil || m.UpgradeErr != nil {
-			return 1 // "return" option in results/error state
+			return 0
 		}
 		if !m.UpdateCheckDone {
 			return 0 // no options while checking
 		}
 		return 1 // "upgrade all" or "return" when up to date
 	case ScreenSync:
+		if m.HasSyncRun {
+			return 0
+		}
 		return 1
 	case ScreenUpgradeSync:
+		if m.HasSyncRun || m.UpgradeReport != nil || m.UpgradeErr != nil {
+			return 0
+		}
 		return 1
 	case ScreenModelConfig:
 		return len(screens.ModelConfigOptions())
@@ -3320,7 +3592,7 @@ func (m Model) optionCount() int {
 	case ScreenUninstallConfirm:
 		return 2
 	case ScreenUninstallResult:
-		return 1
+		return 0
 	case ScreenDetection:
 		return len(screens.DetectionOptions())
 	case ScreenAgents:
@@ -3342,13 +3614,19 @@ func (m Model) optionCount() int {
 	case ScreenOpenCodePlugins:
 		return screens.OpenCodePluginsOptionCount()
 	case ScreenOpenCodePluginResult:
-		return 1
+		return 0
+	case ScreenOpenCodePluginUninstall:
+		return screens.OpenCodePluginUninstallOptionCount(m.OpenCodePluginUninstallInstalled)
+	case ScreenOpenCodePluginUninstallConfirm:
+		return 0
+	case ScreenOpenCodePluginUninstallResult:
+		return 0
 	case ScreenCommunityTools:
 		return screens.CommunityToolsOptionCount()
 	case ScreenCommunityToolInstalling:
 		return 0
 	case ScreenCommunityToolResult:
-		return 1
+		return 0
 	case ScreenModelPicker:
 		if len(m.ModelPicker.AvailableIDs) == 0 {
 			return 2 // Continue with defaults + Back
@@ -3364,19 +3642,19 @@ func (m Model) optionCount() int {
 	case ScreenReview:
 		return len(screens.ReviewOptions())
 	case ScreenInstalling:
-		return 1
+		return 0
 	case ScreenComplete:
-		return 1
+		return 0
 	case ScreenBackups:
 		return len(m.Backups) + 1
 	case ScreenRestoreConfirm:
 		return 2 // "Restore" + "Cancel"
 	case ScreenRestoreResult:
-		return 1 // "Done" / continue
+		return 0
 	case ScreenDeleteConfirm:
 		return 2 // "Delete" + "Cancel"
 	case ScreenDeleteResult:
-		return 1 // "Done" / continue
+		return 0
 	case ScreenRenameBackup:
 		return 0 // text input mode — no cursor navigation
 	case ScreenProfiles:
@@ -3403,7 +3681,7 @@ func (m Model) optionCount() int {
 	case ScreenAgentBuilderInstalling:
 		return 0 // no cursor navigation while installing
 	case ScreenAgentBuilderComplete:
-		return 1 // Done
+		return 0
 	case ScreenUpdatePrompt:
 		return len(screens.UpdatePromptOptions()) // Update now / View changes / Keep current
 	default:
@@ -3691,8 +3969,8 @@ func (m Model) confirmOpenCodePlugins() (tea.Model, tea.Cmd) {
 			m.OpenCodePluginRegistrationResults = nil
 			m.OpenCodePluginRegistrationErr = nil
 			m.OperationRunning = len(m.Selection.OpenCodePlugins) > 0
-			m.setScreen(ScreenOpenCodePluginResult)
 			if len(m.Selection.OpenCodePlugins) == 0 {
+				m.setScreen(ScreenOpenCodePluginResult)
 				return m, nil
 			}
 			return m, m.startOpenCodePluginRegistration()
@@ -3756,6 +4034,68 @@ func (m Model) goBackFromOpenCodePlugins() Model {
 
 func opencodepluginDefinitions() []model.OpenCodeCommunityPluginID {
 	return []model.OpenCodeCommunityPluginID{model.OpenCodePluginSubAgentStatusline, model.OpenCodePluginSDDEngramManage}
+}
+
+// openCodePluginUninstallInstalledFromTUI reads ~/.config/opencode/tui.json's
+// plugin[] list and maps package names back to OpenCodeCommunityPluginIDs so
+// the uninstall Select screen can offer the user a list of what is actually
+// installed. Unknown entries (e.g. third-party packages, the GentleLogo .tsx
+// absolute path) are mapped when recognized and ignored otherwise. Returns
+// an empty slice if tui.json is missing, malformed, or has no plugin[] field.
+func openCodePluginUninstallInstalledFromTUI(home string) []model.OpenCodeCommunityPluginID {
+	if home == "" {
+		return nil
+	}
+	tuiPath := filepath.Join(home, ".config", "opencode", "tui.json")
+	data, err := os.ReadFile(tuiPath)
+	if err != nil || len(bytes.TrimSpace(data)) == 0 {
+		return nil
+	}
+	root := map[string]any{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil
+	}
+	raw, ok := root["plugin"].([]any)
+	if !ok {
+		return nil
+	}
+	knownByPackage := map[string]model.OpenCodeCommunityPluginID{}
+	for _, def := range opencodeplugin.Definitions() {
+		knownByPackage[def.PackageName] = def.ID
+	}
+	// Match the GentleLogo plugin by either separator form because the
+	// Install path uses filepath.Join (native separator for the host).
+	gentleLogoSuffixes := []string{
+		filepath.Join("tui-plugins", "gentle-logo.tsx"),
+		"tui-plugins/gentle-logo.tsx",
+	}
+	seen := map[model.OpenCodeCommunityPluginID]bool{}
+	out := make([]model.OpenCodeCommunityPluginID, 0, len(raw))
+	for _, item := range raw {
+		entry, ok := item.(string)
+		if !ok {
+			continue
+		}
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if id, ok := knownByPackage[entry]; ok && !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+			continue
+		}
+		if !seen[model.OpenCodePluginGentleLogo] {
+			for _, suffix := range gentleLogoSuffixes {
+				if strings.HasSuffix(entry, suffix) {
+					seen[model.OpenCodePluginGentleLogo] = true
+					out = append(out, model.OpenCodePluginGentleLogo)
+					break
+				}
+			}
+		}
+	}
+	return out
 }
 
 func communityToolDefinitions() []communitytool.Definition {
@@ -4348,6 +4688,8 @@ func (m Model) confirmProfileCreate() (tea.Model, tea.Cmd) {
 			}
 			m = m.withResetSyncState()
 			m.setScreen(ScreenSync)
+			m.OperationRunning = true
+			m.OperationMode = "sync"
 			return m, tea.Batch(tickCmd(), m.startSync(m.PendingSyncOverrides))
 		default: // "Cancel"
 			m.setScreen(ScreenProfiles)

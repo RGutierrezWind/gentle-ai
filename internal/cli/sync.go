@@ -22,6 +22,7 @@ import (
 	"github.com/gentleman-programming/gentle-ai/internal/components/filemerge"
 	"github.com/gentleman-programming/gentle-ai/internal/components/gga"
 	"github.com/gentleman-programming/gentle-ai/internal/components/mcp"
+	"github.com/gentleman-programming/gentle-ai/internal/components/opencodeplugin"
 	"github.com/gentleman-programming/gentle-ai/internal/components/permissions"
 	"github.com/gentleman-programming/gentle-ai/internal/components/persona"
 	"github.com/gentleman-programming/gentle-ai/internal/components/sdd"
@@ -51,6 +52,11 @@ type SyncFlags struct {
 	// --profile and --profile-phase flags before parsing into model.Profile.
 	rawProfiles      []string
 	rawProfilePhases []string
+	skillsSet        bool
+	sddModeSet       bool
+	strictTDDSet     bool
+	permissionsSet   bool
+	themeSet         bool
 }
 
 // SyncResult holds the outcome of a sync execution.
@@ -97,6 +103,20 @@ func ParseSyncFlags(args []string) (SyncFlags, error) {
 	if err := fs.Parse(args); err != nil {
 		return SyncFlags{}, err
 	}
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "skill", "skills":
+			opts.skillsSet = true
+		case "sdd-mode":
+			opts.sddModeSet = true
+		case "strict-tdd":
+			opts.strictTDDSet = true
+		case "include-permissions":
+			opts.permissionsSet = true
+		case "include-theme":
+			opts.themeSet = true
+		}
+	})
 
 	if fs.NArg() > 0 {
 		return SyncFlags{}, fmt.Errorf("unexpected sync argument %q", fs.Arg(0))
@@ -255,22 +275,9 @@ func parseProfilePhaseFlag(raw string) (name, phase string, assignment model.Mod
 // parseModelSpec parses a "provider/model" or "provider:model" string into a
 // ModelAssignment. Returns an error if the spec is empty or has no separator.
 func parseModelSpec(spec string) (model.ModelAssignment, error) {
-	// Try slash separator first (common CLI format: anthropic/claude-haiku-3-5),
-	// then colon (opencode internal format: anthropic:claude-haiku-3-5).
-	sep := -1
-	for i, c := range spec {
-		if c == '/' || c == ':' {
-			sep = i
-			break
-		}
-	}
-	if sep <= 0 {
+	providerID, modelID, ok := model.SplitModelSpec(spec)
+	if !ok {
 		return model.ModelAssignment{}, fmt.Errorf("invalid model spec %q: expected provider/model or provider:model", spec)
-	}
-	providerID := spec[:sep]
-	modelID := spec[sep+1:]
-	if providerID == "" || modelID == "" {
-		return model.ModelAssignment{}, fmt.Errorf("invalid model spec %q: provider and model must both be non-empty", spec)
 	}
 	return model.ModelAssignment{ProviderID: providerID, ModelID: modelID}, nil
 }
@@ -332,6 +339,42 @@ func BuildSyncSelection(flags SyncFlags, agentIDs []model.AgentID) model.Selecti
 		// Persona is left as zero-value here. RunSync resolves it from state.json
 		// when present. Missing or invalid persisted persona resolves to neutral
 		// so sync does not silently reactivate regional persona behavior.
+	}
+}
+
+func RestorePersistedSelection(selection *model.Selection, persisted state.InstallState, flags SyncFlags) {
+	if !persisted.SelectionConfigured {
+		return
+	}
+	explicit := *selection
+	persisted.RestoreSelection(selection)
+	if flags.skillsSet {
+		selection.Skills = explicit.Skills
+		setSelectionComponent(selection, model.ComponentSkills, true, true)
+	}
+	if flags.sddModeSet {
+		selection.SDDMode = explicit.SDDMode
+	}
+	if flags.strictTDDSet {
+		selection.StrictTDD = explicit.StrictTDD
+	}
+	setSelectionComponent(selection, model.ComponentPermission, flags.permissionsSet, flags.IncludePermissions)
+	setSelectionComponent(selection, model.ComponentTheme, flags.themeSet, flags.IncludeTheme)
+}
+
+func setSelectionComponent(selection *model.Selection, component model.ComponentID, configured, included bool) {
+	if !configured {
+		return
+	}
+	filtered := selection.Components[:0]
+	for _, current := range selection.Components {
+		if current != component {
+			filtered = append(filtered, current)
+		}
+	}
+	selection.Components = filtered
+	if included {
+		selection.Components = append(selection.Components, component)
 	}
 }
 
@@ -445,6 +488,22 @@ func (r *syncRuntime) stagePlan() pipeline.StagePlan {
 		})
 	}
 
+	// Managed OpenCode-compatible plugins are versioned runtime artifacts tied
+	// to the installed binary (OpenCode and Kilocode receive them). When the
+	// persisted selection lacks the SDD component, no SDD step is planned and
+	// already-installed plugins would silently stay stale after upgrades
+	// (issue #1440). Refresh installed copies explicitly; the step never
+	// installs plugins that were never present. When SDD is selected, its
+	// inject step already rewrites the plugins.
+	if anyAgentReceivesManagedOpenCodePlugins(r.agentIDs) && !r.selection.HasComponent(model.ComponentSDD) {
+		apply = append(apply, openCodePluginRefreshSyncStep{
+			id:           "sync:opencode:managed-plugins",
+			homeDir:      r.homeDir,
+			agents:       r.agentIDs,
+			changedFiles: &r.changedFiles,
+		})
+	}
+
 	if r.selection.HasCommunityTool(model.CommunityToolCodeGraph) {
 		apply = append(apply, &codeGraphGuidanceSyncStep{
 			id:           "sync:community-tool:codegraph-guidance",
@@ -467,6 +526,19 @@ func syncBackupTargets(homeDir, workspaceDir string, selection model.Selection, 
 	for _, component := range selection.Components {
 		for _, path := range syncComponentPathsWithWorkspace(homeDir, workspaceDir, selection, adapters, component) {
 			paths[path] = struct{}{}
+		}
+	}
+	// Managed OpenCode-compatible plugin paths are part of sync's
+	// backup/snapshot contract whenever a plugin-receiving agent (OpenCode,
+	// Kilocode) is synced, independent of the SDD component: the
+	// openCodePluginRefreshSyncStep may rewrite installed copies (issue #1440).
+	for _, adapter := range adapters {
+		if !sdd.AgentReceivesManagedOpenCodePlugins(adapter.Agent()) {
+			continue
+		}
+		pluginsDir := filepath.Join(adapter.GlobalConfigDir(homeDir), "plugins")
+		for _, name := range sdd.ManagedOpenCodePluginNames() {
+			paths[filepath.Join(pluginsDir, name)] = struct{}{}
 		}
 	}
 	if selection.HasCommunityTool(model.CommunityToolCodeGraph) {
@@ -593,6 +665,46 @@ type codeGraphGuidanceSyncStep struct {
 type piCodeGraphSyncStep struct {
 	id, homeDir, workspaceDir string
 	changedFiles              *[]string
+}
+
+// openCodePluginRefreshSyncStep refreshes already-installed managed
+// OpenCode-compatible plugins (OpenCode, Kilocode) from the embedded assets
+// when the SDD component is not part of the sync selection (issue #1440).
+// It never creates plugins that were never installed.
+type openCodePluginRefreshSyncStep struct {
+	id           string
+	homeDir      string
+	agents       []model.AgentID
+	changedFiles *[]string
+}
+
+func (s openCodePluginRefreshSyncStep) ID() string { return s.id }
+
+func (s openCodePluginRefreshSyncStep) Run() error {
+	for _, adapter := range resolveAdapters(s.agents) {
+		if !sdd.AgentReceivesManagedOpenCodePlugins(adapter.Agent()) {
+			continue
+		}
+		res, err := sdd.RefreshInstalledOpenCodePlugins(s.homeDir, adapter)
+		if err != nil {
+			return fmt.Errorf("sync managed OpenCode plugins: %w", err)
+		}
+		if s.changedFiles != nil && res.Changed {
+			*s.changedFiles = append(*s.changedFiles, res.Files...)
+		}
+	}
+	return nil
+}
+
+// anyAgentReceivesManagedOpenCodePlugins reports whether any synced agent
+// receives the managed OpenCode-compatible plugins from the SDD injector.
+func anyAgentReceivesManagedOpenCodePlugins(agentIDs []model.AgentID) bool {
+	for _, id := range agentIDs {
+		if sdd.AgentReceivesManagedOpenCodePlugins(id) {
+			return true
+		}
+	}
+	return false
 }
 
 var refreshPiCodeGraphIfConfigured = communitytool.RefreshPiCodeGraphIfConfigured
@@ -881,8 +993,25 @@ func (s componentSyncStep) Run() error {
 		}
 		return nil
 
+	case model.ComponentClaudeTheme:
+		for _, adapter := range adapters {
+			res, err := theme.InjectClaudeTheme(s.homeDir, adapter)
+			if err != nil {
+				return fmt.Errorf("sync Claude theme for %q: %w", adapter.Agent(), err)
+			}
+			s.countChanged(boolToInt(res.Changed), res.Files...)
+		}
+		return nil
+
+	case model.ComponentOpenCodeGentleLogo:
+		res, err := opencodeplugin.Install(s.homeDir, model.OpenCodePluginGentleLogo)
+		if err != nil {
+			return fmt.Errorf("sync OpenCode Gentle Logo plugin: %w", err)
+		}
+		s.countChanged(boolToInt(res.Changed), res.Files...)
+		return nil
+
 	default:
-		// Persona and any unknown components are out of sync scope.
 		return fmt.Errorf("component %q is not supported in sync runtime", s.component)
 	}
 }
@@ -1233,6 +1362,7 @@ func RunSync(args []string) (SyncResult, error) {
 	// On error (e.g. state.json absent), treat persisted values as empty — model
 	// maps stay as-is and persona falls back to neutral.
 	persistedState, _ := state.Read(homeDir)
+	RestorePersistedSelection(&selection, persistedState, flags)
 	restorePersistedCommunityTools(homeDir, &selection, persistedState)
 
 	// Load persisted model assignments from state when not provided via flags.
@@ -1357,7 +1487,7 @@ func restorePersistedCommunityTools(homeDir string, selection *model.Selection, 
 func hasManagedPiCodeGraphManifest(homeDir string) bool {
 	path := filepath.Join(homeDir, ".gentle-ai", "pi-codegraph.json")
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	if err != nil || !info.Mode().IsRegular() || runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		return false
 	}
 	data, err := os.ReadFile(path)

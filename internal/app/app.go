@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/gentleman-programming/gentle-ai/internal/backup"
 	"github.com/gentleman-programming/gentle-ai/internal/cli"
+	"github.com/gentleman-programming/gentle-ai/internal/components/opencodeplugin"
 	componentuninstall "github.com/gentleman-programming/gentle-ai/internal/components/uninstall"
 	"github.com/gentleman-programming/gentle-ai/internal/model"
 	"github.com/gentleman-programming/gentle-ai/internal/pipeline"
@@ -78,14 +79,21 @@ func RunArgs(args []string, stdout io.Writer) error {
 			printHelp(stdout, Version)
 			return nil
 		case "uninstall":
-			_, err := cli.RunUninstall(args[1:], stdout)
-			return err
+			if len(args) >= 2 && args[1] == "opencode-plugin" {
+				_, err := cli.RunUninstallOpenCodePlugin(args[2:], stdout)
+				return err
+			}
+			return runUninstall(args[1:], stdout)
 		case "skill-registry":
 			return runSkillRegistry(args[1:], stdout)
 		case "sdd-status":
 			return cli.RunSDDStatus(args[1:], stdout)
 		case "sdd-continue":
 			return cli.RunSDDContinue(args[1:], stdout)
+		case "sdd-attempt":
+			return cli.RunSDDAttempt(args[1:], stdout)
+		case "sdd-verify-validate":
+			return cli.RunSDDVerifyValidate(args[1:], stdout)
 		case "codegraph":
 			return cli.RunCodeGraph(args[1:], stdout)
 		case "review":
@@ -195,6 +203,12 @@ func RunArgs(args []string, stdout io.Writer) error {
 		m.SyncFn = tuiSync(homeDir)
 		m.UninstallFn = tuiUninstall(homeDir)
 		m.UninstallWithProfilesFn = tuiUninstallWithProfiles(homeDir)
+		// Slice 3b — wire the 4-layer managed-uninstall runner used by the
+		// standalone "Uninstall OpenCode Plugin" TUI shortcut. The TUI
+		// model falls back to opencodeplugin.Uninstall when this field is
+		// nil; assigning it explicitly here keeps the production wiring
+		// visible at the same seam as the other injected functions.
+		m.OpenCodePluginUninstallFn = opencodeplugin.Uninstall
 		finalModel, err := runTUI(m, tea.WithAltScreen())
 		if err != nil {
 			return err
@@ -232,20 +246,6 @@ func RunArgs(args []string, stdout io.Writer) error {
 
 		_, _ = fmt.Fprintln(stdout, cli.RenderSyncReport(syncResult))
 		return nil
-	case "uninstall":
-		uninstallResult, err := cli.RunUninstall(args[1:], stdout)
-		if err != nil {
-			// If a backup was created before the failure, surface it so
-			// the user can restore safely.
-			if uninstallResult.Manifest.ID != "" {
-				_, _ = fmt.Fprintln(stdout, cli.RenderUninstallReport(uninstallResult))
-			}
-			return err
-		}
-		if uninstallResult.Manifest.ID != "" {
-			_, _ = fmt.Fprintln(stdout, cli.RenderUninstallReport(uninstallResult))
-		}
-		return nil
 	case "restore":
 		return cli.RunRestore(args[1:], stdout)
 	case "doctor":
@@ -253,6 +253,14 @@ func RunArgs(args []string, stdout io.Writer) error {
 	default:
 		return fmt.Errorf("unknown command %q — run 'gentle-ai help' for available commands", args[0])
 	}
+}
+
+func runUninstall(args []string, stdout io.Writer) error {
+	result, err := cli.RunUninstall(args, stdout)
+	if result.Manifest.ID != "" {
+		_, _ = fmt.Fprintln(stdout, cli.RenderUninstallReport(result))
+	}
+	return err
 }
 
 func hasHelpFlag(args []string) bool {
@@ -426,7 +434,7 @@ func runUpdate(ctx context.Context, currentVersion string, profile system.Platfo
 //   - Snapshots agent config paths before execution (config preservation by design)
 //   - Executes binary-only upgrades; does NOT invoke install or sync pipelines
 //   - Skips gentle-ai itself when running as a dev build (version="dev")
-//   - Falls back to manual guidance for unsafe platforms (Windows binary self-replace)
+//   - Falls back to source-install guidance where official binaries are unavailable
 func runUpgrade(ctx context.Context, args []string, detection system.DetectionResult, stdout io.Writer) error {
 	dryRun := false
 	noBackup := false
@@ -526,7 +534,7 @@ func tuiExecute(
 			agentIDs = append(agentIDs, string(a))
 		}
 		claudePhaseState := claudePhaseAssignmentsToState(selection.ClaudePhaseAssignments)
-		if writeErr := state.Write(homeDir, state.InstallState{
+		installState := state.InstallState{
 			InstalledAgents:             agentIDs,
 			CommunityTools:              appCommunityToolIDsToStrings(selection.CommunityTools),
 			CommunityToolsConfigured:    true,
@@ -539,7 +547,9 @@ func tuiExecute(
 			CodexPhaseModelAssignments:  selection.CodexPhaseModelAssignments,
 			ModelAssignments:            modelAssignmentsToState(selection.ModelAssignments),
 			Persona:                     string(selection.Persona),
-		}); writeErr != nil {
+		}
+		installState.SetSelection(selection)
+		if writeErr := state.Write(homeDir, installState); writeErr != nil {
 			execResult.Err = fmt.Errorf("persist install state: %w", writeErr)
 		}
 	}
@@ -656,6 +666,12 @@ func syncShouldIncludePermissions(agentIDs []model.AgentID) bool {
 }
 
 func syncArgsForDiscoveredAgents(homeDir string) []string {
+	if persisted, err := state.Read(homeDir); err == nil && persisted.SelectionConfigured {
+		if (model.Selection{Components: persisted.Components}).HasComponent(model.ComponentPermission) {
+			return []string{"--include-permissions"}
+		}
+		return nil
+	}
 	if syncShouldIncludePermissions(cli.DiscoverAgents(homeDir)) {
 		return []string{"--include-permissions"}
 	}
@@ -726,6 +742,7 @@ func loadPersistedAssignments(homeDir string, selection *model.Selection) {
 	if err != nil {
 		return
 	}
+	cli.RestorePersistedSelection(selection, s, cli.SyncFlags{})
 	if len(selection.ClaudePhaseAssignments) == 0 && len(s.ClaudePhaseAssignments) > 0 {
 		m := make(map[string]model.ClaudePhaseAssignment, len(s.ClaudePhaseAssignments))
 		for k, v := range s.ClaudePhaseAssignments {

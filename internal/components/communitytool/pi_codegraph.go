@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -26,9 +27,10 @@ const (
 )
 
 var (
-	piCodeGraphAtomicWrite = filemerge.WriteFileAtomic
-	piCodeGraphReadFile    = os.ReadFile
-	piCodeGraphRemove      = os.Remove
+	piCodeGraphAtomicWrite  = filemerge.WriteFileAtomic
+	piCodeGraphReadFile     = os.ReadFile
+	piCodeGraphRemove       = os.Remove
+	piCodeGraphManifestStat = os.Stat
 )
 
 var piCodeGraphEffectiveMCPProbe PiCodeGraphEffectiveMCPProbe = probePiCodeGraphMCP
@@ -348,13 +350,31 @@ func piChildTools(body string) ([]string, bool, bool) {
 		return nil, false, true
 	}
 	frontmatter := body[4 : 4+end]
-	for _, line := range strings.Split(frontmatter, "\n") {
+	lines := strings.Split(frontmatter, "\n")
+	for i, line := range lines {
 		key, value, ok := strings.Cut(line, ":")
 		if !ok || strings.TrimSpace(key) != "tools" {
 			continue
 		}
 		value = strings.TrimSpace(value)
-		if value == "" || (strings.HasPrefix(value, "[") != strings.HasSuffix(value, "]")) {
+		if value == "" {
+			var tools []string
+			for _, item := range lines[i+1:] {
+				trimmed := strings.TrimSpace(item)
+				if !strings.HasPrefix(item, " ") && !strings.HasPrefix(item, "\t") {
+					break
+				}
+				if !strings.HasPrefix(trimmed, "- ") || strings.TrimSpace(strings.TrimPrefix(trimmed, "- ")) == "" {
+					return nil, false, true
+				}
+				tools = append(tools, strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "- ")), "\"'"))
+			}
+			if len(tools) == 0 {
+				return nil, false, true
+			}
+			return tools, true, false
+		}
+		if strings.HasPrefix(value, "[") != strings.HasSuffix(value, "]") {
 			return nil, false, true
 		}
 		tools := strings.FieldsFunc(strings.Trim(value, "[]"), func(r rune) bool { return r == ',' || r == ' ' })
@@ -393,6 +413,12 @@ func replacePiChildTools(body string, tools []string) string {
 	for i, line := range lines {
 		if key, _, ok := strings.Cut(line, ":"); ok && strings.TrimSpace(key) == "tools" {
 			lines[i] = "tools: " + strings.Join(tools, ", ")
+			end := i + 1
+			for end < len(lines) && (strings.HasPrefix(lines[end], " ") || strings.HasPrefix(lines[end], "\t")) {
+				end++
+			}
+			lines = append(lines[:i+1], lines[end:]...)
+			break
 		}
 	}
 	return strings.Join(lines, "\n") + body[frontEnd:]
@@ -828,14 +854,22 @@ func readPiCodeGraphManifest(path string) (piCodeGraphManifest, error) {
 	if err != nil {
 		return piCodeGraphManifest{}, err
 	}
-	if info, statErr := os.Stat(path); statErr != nil || info.Mode().Perm()&0o077 != 0 {
-		return piCodeGraphManifest{}, fmt.Errorf("Pi CodeGraph manifest %q has unsafe permissions", path)
+	info, err := piCodeGraphManifestStat(path)
+	if err != nil {
+		return piCodeGraphManifest{}, fmt.Errorf("stat Pi CodeGraph manifest %q: %w", path, err)
+	}
+	if !piCodeGraphManifestPermissionsSafe(runtime.GOOS, info.Mode()) {
+		return piCodeGraphManifest{}, fmt.Errorf("Pi CodeGraph manifest %q has unsafe permissions %#o", path, info.Mode().Perm())
 	}
 	var manifest piCodeGraphManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return piCodeGraphManifest{}, err
 	}
 	return manifest, nil
+}
+
+func piCodeGraphManifestPermissionsSafe(goos string, mode os.FileMode) bool {
+	return goos == "windows" || mode.Perm()&0o077 == 0
 }
 
 func restoreMissingPiChildren(children map[string]piCodeGraphOwnedFile, journal *piJournal, changed map[string]struct{}) error {

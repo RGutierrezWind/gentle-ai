@@ -310,7 +310,6 @@ func TestPiAgentInstallRunsPackageCommandsWhenPiAlreadyInstalled(t *testing.T) {
 		"pi install npm:pi-mcp-adapter",
 		engramInitCommandForTest(),
 		"pi install npm:pi-subagents-j0k3r",
-		"pi install npm:pi-intercom",
 		"pi install npm:@juicesharp/rpiv-ask-user-question",
 		"pi install npm:pi-web-access",
 		"pi install npm:@juicesharp/rpiv-todo",
@@ -1377,7 +1376,9 @@ func TestRunInstallGGALinuxIncludesTempCleanupBeforeClone(t *testing.T) {
 		if strings.Contains(cmd, "rm -rf /tmp/gentleman-guardian-angel") {
 			cleanupIdx = i
 		}
-		if strings.Contains(cmd, "git clone https://github.com/Gentleman-Programming/gentleman-guardian-angel.git /tmp/gentleman-guardian-angel") {
+		// Match the clone intent (URL + dest) instead of the full literal command,
+		// so the test stays valid when extra flags like --depth/--branch are added.
+		if strings.Contains(cmd, "git") && strings.Contains(cmd, "https://github.com/Gentleman-Programming/gentleman-guardian-angel.git") && strings.Contains(cmd, "/tmp/gentleman-guardian-angel") {
 			cloneIdx = i
 		}
 	}

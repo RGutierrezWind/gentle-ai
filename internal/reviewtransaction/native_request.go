@@ -41,6 +41,7 @@ func BuildNativeGateRequest(ctx context.Context, repo string, input NativeGateRe
 	if err != nil {
 		return GateRequest{}, fmt.Errorf("load authoritative review chain: %w", err)
 	}
+	transaction := chain.Records[len(chain.Records)-1].Transaction
 	bundleDigest := chain.Identity
 	if strings.TrimSpace(input.BundleArtifact) != "" {
 		authoritative, err := store.ExportBundle()
@@ -71,7 +72,6 @@ func BuildNativeGateRequest(ctx context.Context, repo string, input NativeGateRe
 	case GatePostApply, GatePreCommit:
 		intended := input.IntendedUntracked
 		if intended == nil {
-			transaction := chain.Records[len(chain.Records)-1].Transaction
 			intended = append([]string(nil), transaction.Snapshot.IntendedUntracked...)
 			if intended == nil {
 				intended = []string{}
@@ -79,26 +79,18 @@ func BuildNativeGateRequest(ctx context.Context, repo string, input NativeGateRe
 		}
 		request.Target = Target{Kind: TargetCurrentChanges, IntendedUntracked: intended}
 	case GatePrePush:
-		head, err := resolveCommit(ctx, repo, "HEAD")
+		deliveryBaseTree := map[TargetKind]string{TargetCurrentChanges: transaction.Snapshot.BaseTree}[transaction.Snapshot.Kind]
+		target, push, err := buildPushTarget(ctx, repo, input.BaseRef, deliveryBaseTree, transaction.Snapshot.BaseTree)
 		if err != nil {
 			return GateRequest{}, err
 		}
-		request.Target = Target{Kind: TargetExactRevision, Revision: head}
+		request.Target, request.Push = target, push
 	case GatePrePR:
-		_, _, baseCommit, err := resolveAuthoritativePublicationBase(ctx, repo)
+		target, prePR, err := buildPrePRTarget(ctx, repo, input.BaseRef, input.PrePRCIAttestation, nil)
 		if err != nil {
 			return GateRequest{}, err
 		}
-		if strings.TrimSpace(input.BaseRef) != "" {
-			expected, expectedErr := resolveCommit(ctx, repo, input.BaseRef)
-			if expectedErr != nil || expected != baseCommit {
-				return GateRequest{}, errors.New("native pre-PR base does not match the remote publication boundary")
-			}
-		}
-		request.Target = Target{Kind: TargetBaseDiff, BaseRef: baseCommit}
-		if strings.TrimSpace(input.PrePRCIAttestation) != "" {
-			request.PrePR = &PrePRRequest{CIAttestationArtifact: input.PrePRCIAttestation}
-		}
+		request.Target, request.PrePR = target, prePR
 	case GateRelease:
 		head, err := resolveCommit(ctx, repo, "HEAD")
 		if err != nil {

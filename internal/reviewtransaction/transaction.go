@@ -46,6 +46,7 @@ const (
 	StateFinalVerifying         State = "final_verifying"
 	StateApproved               State = "approved"
 	StateEscalated              State = "escalated"
+	StateInvalidated            State = "invalidated"
 )
 
 type EvidenceClass string
@@ -110,21 +111,25 @@ type LensResult struct {
 }
 
 type Finding struct {
-	ID        string   `json:"id"`
-	Lens      string   `json:"lens,omitempty"`
-	Location  string   `json:"location,omitempty"`
-	Severity  string   `json:"severity,omitempty"`
-	Claim     string   `json:"claim,omitempty"`
-	ProofRefs []string `json:"proof_refs,omitempty"`
+	ID                string            `json:"id"`
+	Lens              string            `json:"lens,omitempty"`
+	Location          string            `json:"location,omitempty"`
+	Severity          string            `json:"severity,omitempty"`
+	Claim             string            `json:"claim,omitempty"`
+	ProofRefs         []string          `json:"proof_refs,omitempty"`
+	EvidenceClass     EvidenceClass     `json:"evidence_class,omitempty"`
+	CausalDisposition CausalDisposition `json:"causal_disposition,omitempty"`
 }
 
 type ScopedValidationResult struct {
-	LedgerIDs            []string        `json:"ledger_ids"`
-	Approved             bool            `json:"approved"`
-	FixCausedFindings    []Finding       `json:"fix_caused_findings"`
-	OriginalCriteria     ValidationCheck `json:"original_criteria"`
-	CorrectionRegression ValidationCheck `json:"correction_regression"`
-	FollowUps            []FollowUp      `json:"follow_ups"`
+	LedgerIDs                     []string        `json:"ledger_ids"`
+	Approved                      bool            `json:"approved"`
+	FixCausedFindings             []Finding       `json:"fix_caused_findings"`
+	OriginalCriteria              ValidationCheck `json:"original_criteria"`
+	CorrectionRegression          ValidationCheck `json:"correction_regression"`
+	FollowUps                     []FollowUp      `json:"follow_ups"`
+	TargetedValidationRequestHash string          `json:"targeted_validation_request_hash,omitempty"`
+	CorrectionTargetIdentity      string          `json:"correction_target_identity,omitempty"`
 }
 
 type ValidationCheck struct {
@@ -187,6 +192,7 @@ type Transaction struct {
 	LedgerHash              string                     `json:"ledger_hash"`
 	LedgerFindingsHash      string                     `json:"ledger_findings_hash"`
 	EvidenceHash            string                     `json:"evidence_hash"`
+	InvalidationReason      string                     `json:"invalidation_reason,omitempty"`
 	JudgeProofHash          string                     `json:"judge_proof_hash,omitempty"`
 	JudgeAgreementHash      string                     `json:"judge_agreement_hash,omitempty"`
 	JudgeProofs             []JudgeProof               `json:"judge_proofs"`
@@ -283,6 +289,21 @@ func (transaction *Transaction) StartReview() error {
 	return nil
 }
 
+// Invalidate terminates only a pristine reviewing authority. It deliberately
+// has no inverse: callers must create a distinct lineage for another review.
+func (transaction *Transaction) Invalidate(reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return errors.New("invalidation reason is required")
+	}
+	if !pristineReviewing(*transaction) {
+		return errors.New("only a pristine reviewing authority may be invalidated")
+	}
+	transaction.State = StateInvalidated
+	transaction.InvalidationReason = reason
+	return nil
+}
+
 func (transaction *Transaction) RecordLensResult(result LensResult) error {
 	if transaction.Mode != ModeOrdinaryBounded || transaction.State != StateReviewing {
 		return transaction.invalidTransition("record lens result")
@@ -334,6 +355,10 @@ func LensResultHash(result LensResult) string {
 }
 
 func validateLensResult(result LensResult) (LensResult, error) {
+	return canonicalLensResult(result, false)
+}
+
+func canonicalLensResult(result LensResult, allowMissingSevereLocation bool) (LensResult, error) {
 	result.Lens = strings.TrimSpace(result.Lens)
 	if !isSupportedLens(result.Lens) {
 		return LensResult{}, fmt.Errorf("unknown review lens %q", result.Lens)
@@ -356,11 +381,17 @@ func validateLensResult(result LensResult) (LensResult, error) {
 		finding.Location = strings.TrimSpace(finding.Location)
 		finding.Severity = strings.ToUpper(strings.TrimSpace(finding.Severity))
 		finding.Claim = strings.TrimSpace(finding.Claim)
+		if finding.EvidenceClass != "" && !isSupportedEvidenceClass(finding.EvidenceClass) {
+			return LensResult{}, fmt.Errorf("lens result finding[%d] has unsupported evidence class %q", index, finding.EvidenceClass)
+		}
+		if finding.CausalDisposition != "" && !isSupportedCausalDisposition(finding.CausalDisposition) {
+			return LensResult{}, fmt.Errorf("lens result finding[%d] has unsupported causal disposition %q", index, finding.CausalDisposition)
+		}
 		finding.ProofRefs = append([]string(nil), finding.ProofRefs...)
 		for proofIndex := range finding.ProofRefs {
 			finding.ProofRefs[proofIndex] = strings.TrimSpace(finding.ProofRefs[proofIndex])
 		}
-		if err := validateStructuredFinding(finding); err != nil {
+		if err := validateLensFinding(finding, allowMissingSevereLocation); err != nil {
 			return LensResult{}, fmt.Errorf("lens result finding[%d]: %w", index, err)
 		}
 		if finding.Lens != wantFindingLens {
@@ -390,6 +421,19 @@ func validateLensResult(result LensResult) (LensResult, error) {
 // reviewer result without mutating a transaction.
 func CanonicalLensResult(result LensResult) (LensResult, error) {
 	return validateLensResult(result)
+}
+
+// CanonicalCompactLensResult preserves malformed severe findings so compact
+// native routing can downgrade unsupported candidate-causality claims.
+func CanonicalCompactLensResult(result LensResult) (LensResult, error) {
+	return canonicalLensResult(result, true)
+}
+
+func validateLensFinding(finding Finding, allowMissingSevereLocation bool) error {
+	if allowMissingSevereLocation && isSevereSeverity(finding.Severity) && finding.Location == "" {
+		finding.Location = "<missing>"
+	}
+	return validateStructuredFinding(finding)
 }
 
 func (transaction *Transaction) RecordJudgeProofs(proofs []JudgeProof, agreementHash string) error {
@@ -850,6 +894,13 @@ func validateTargetedValidation(result ScopedValidationResult, fixDeltaHash stri
 			return fmt.Errorf("%s check is stale for the immutable fix delta", name)
 		}
 	}
+	if (result.TargetedValidationRequestHash == "") != (result.CorrectionTargetIdentity == "") {
+		return errors.New("targeted validation request binding is partial")
+	}
+	if result.TargetedValidationRequestHash != "" &&
+		(!validSHA256(result.TargetedValidationRequestHash) || !validSHA256(result.CorrectionTargetIdentity)) {
+		return errors.New("targeted validation request binding is invalid")
+	}
 	return nil
 }
 
@@ -1049,12 +1100,23 @@ func (transaction *Transaction) validate() error {
 	switch transaction.State {
 	case StateUnreviewed, StateReviewing, StateJudgesConfirmed, StateFindingsFrozen, StateEvidenceClassified,
 		StateFixRequired, StateFixing, StateFixValidating, StateReadyFinalVerification,
-		StateFinalVerifying, StateApproved, StateEscalated:
+		StateFinalVerifying, StateApproved, StateEscalated, StateInvalidated:
 	default:
 		return fmt.Errorf("invalid transaction state %q", transaction.State)
 	}
 	if err := validateCounters(transaction.Mode, transaction.Counters); err != nil {
 		return err
+	}
+	if transaction.State == StateInvalidated {
+		reviewing := *transaction
+		reviewing.State, reviewing.InvalidationReason = StateReviewing, ""
+		if !pristineReviewing(reviewing) || strings.TrimSpace(transaction.InvalidationReason) == "" {
+			return errors.New("invalidated transaction must retain only a pristine reviewing authority and reason")
+		}
+		return nil
+	}
+	if transaction.InvalidationReason != "" {
+		return errors.New("only an invalidated transaction may contain an invalidation reason")
 	}
 	if err := transaction.validateLensState(); err != nil {
 		return err
@@ -1081,6 +1143,20 @@ func (transaction *Transaction) validate() error {
 
 func (transaction *Transaction) hasCorrectionBudget() bool {
 	return transaction.Mode == ModeOrdinaryBounded && transaction.OriginalChangedLines != nil && transaction.CorrectionBudget != nil
+}
+
+func pristineReviewing(transaction Transaction) bool {
+	if transaction.State != StateReviewing || transaction.LedgerHash != "" || transaction.LedgerFindingsHash != "" ||
+		transaction.EvidenceHash != "" || transaction.JudgeProofHash != "" || transaction.JudgeAgreementHash != "" ||
+		transaction.Release != nil || transaction.FailedEvidenceRevision != "" || transaction.FixDeltaHash != EmptyFixDeltaHash ||
+		!snapshotsEqual(transaction.Snapshot, Snapshot{Kind: transaction.Snapshot.Kind, BaseTree: transaction.BaseTree, CandidateTree: transaction.InitialReviewTree, PathsDigest: transaction.PathsDigest, IntendedUntracked: transaction.Snapshot.IntendedUntracked, IntendedUntrackedProof: transaction.Snapshot.IntendedUntrackedProof, LedgerIDs: transaction.Snapshot.LedgerIDs, Paths: transaction.Snapshot.Paths, Identity: transaction.Snapshot.Identity}) ||
+		transaction.FinalCandidateTree != transaction.InitialReviewTree || len(transaction.LensResults) != 0 || len(transaction.Findings) != 0 ||
+		len(transaction.Classifications) != 0 || len(transaction.Outcomes) != 0 || len(transaction.FixFindingIDs) != 0 || len(transaction.PendingRefuterIDs) != 0 ||
+		len(transaction.FixCausedFindings) != 0 || len(transaction.FollowUps) != 0 || len(transaction.JudgeProofs) != 0 ||
+		transaction.OriginalCriteria != nil || transaction.CorrectionRegression != nil || transaction.ProposedCorrectionLines != nil || transaction.ActualCorrectionLines != nil {
+		return false
+	}
+	return validInitialStoreRecord(Record{Operation: "review/start", Transaction: transaction})
 }
 
 func (transaction *Transaction) validateCorrectionBudget() error {
@@ -1152,6 +1228,16 @@ func (transaction *Transaction) escalateBudget(name string) error {
 }
 
 func validateSnapshot(snapshot Snapshot) error {
+	projection, err := canonicalProjection(snapshot.Projection)
+	if err != nil || projection != snapshot.Projection {
+		return errors.New("snapshot projection is unsupported or non-canonical")
+	}
+	if projection == ProjectionStaged && snapshot.Kind != TargetCurrentChanges && snapshot.Kind != TargetBaseDiff && snapshot.Kind != TargetFixDiff {
+		return errors.New("staged snapshot projection requires current-changes, base-diff, or fix-diff")
+	}
+	if projection == ProjectionStaged && len(snapshot.IntendedUntracked) != 0 {
+		return errors.New("staged snapshot projection cannot contain intended-untracked paths")
+	}
 	if snapshot.Kind == "" || !validGitTree(snapshot.BaseTree) || !validGitTree(snapshot.CandidateTree) {
 		return errors.New("snapshot requires kind, base_tree, and candidate_tree")
 	}
@@ -1199,7 +1285,7 @@ func validateSelectedLenses(mode Mode, riskLevel RiskLevel, lenses []string) ([]
 		}
 		return nil, nil
 	}
-	validated := append([]string(nil), lenses...)
+	validated := append([]string{}, lenses...)
 	want := -1
 	switch riskLevel {
 	case RiskLow:
@@ -1468,20 +1554,20 @@ func (transaction *Transaction) validateFindingRouting() error {
 	if hasStringIntersection(fixIDs, pendingIDs) {
 		return errors.New("a severe finding cannot be both correction-bound and pending refutation")
 	}
-	if transaction.State != StateUnreviewed && transaction.State != StateReviewing && transaction.State != StateJudgesConfirmed && (!validSHA256(transaction.LedgerHash) || !validSHA256(transaction.LedgerFindingsHash) || transaction.LedgerFindingsHash != findingsHash(transaction.Findings)) {
+	if transaction.State != StateUnreviewed && transaction.State != StateReviewing && transaction.State != StateJudgesConfirmed && transaction.State != StateInvalidated && (!validSHA256(transaction.LedgerHash) || !validSHA256(transaction.LedgerFindingsHash) || transaction.LedgerFindingsHash != findingsHash(transaction.Findings)) {
 		return errors.New("frozen review state requires a content-bound ledger hash")
 	}
 	return transaction.validateFindingState(findings, severe)
 }
 
 func findingsHash(findings []Finding) string {
-	payload, _ := json.Marshal(findings)
+	payload, _ := json.Marshal(ledgerProjection(findings))
 	sum := sha256.Sum256(append([]byte("gentle-ai.review-ledger-findings/v1\x00"), payload...))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func (transaction *Transaction) validateFindingState(findings, severe map[string]Finding) error {
-	beforeFreeze := transaction.State == StateUnreviewed || transaction.State == StateReviewing || transaction.State == StateJudgesConfirmed
+	beforeFreeze := transaction.State == StateUnreviewed || transaction.State == StateReviewing || transaction.State == StateJudgesConfirmed || transaction.State == StateInvalidated
 	if beforeFreeze {
 		if len(findings) != 0 || len(transaction.Classifications) != 0 || len(transaction.Outcomes) != 0 || len(transaction.FixFindingIDs) != 0 || len(transaction.PendingRefuterIDs) != 0 {
 			return errors.New("pre-freeze transaction cannot contain findings or evidence routing")
@@ -1721,7 +1807,7 @@ func equalStrings(left, right []string) bool {
 
 func isConcreteEvidence(value string) bool {
 	trimmed := strings.TrimSpace(value)
-	if trimmed == "" || strings.ContainsAny(trimmed, "{}<>") {
+	if trimmed == "" {
 		return false
 	}
 	switch strings.ToLower(trimmed) {
@@ -1734,6 +1820,15 @@ func isConcreteEvidence(value string) bool {
 func isSupportedCausalDisposition(disposition CausalDisposition) bool {
 	switch disposition {
 	case CausalIntroduced, CausalBehaviorActivated, CausalWorsened, CausalPreExisting, CausalBaseOnly, CausalUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+func isSupportedEvidenceClass(class EvidenceClass) bool {
+	switch class {
+	case EvidenceDeterministic, EvidenceInferential, EvidenceInsufficient:
 		return true
 	default:
 		return false

@@ -538,6 +538,11 @@ func TestInjectOpenCodeIsIdempotent(t *testing.T) {
 	if !first.Changed {
 		t.Fatalf("Inject() first changed = false")
 	}
+	settingsPath := opencodeAdapter().SettingsPath(home)
+	firstSettings, err := os.ReadFile(settingsPath)
+	if err != nil || !bytes.Contains(firstSettings, []byte(`"default_agent": "gentle-orchestrator"`)) {
+		t.Fatalf("first settings missing managed default: %s, err = %v", firstSettings, err)
+	}
 
 	second, err := Inject(home, opencodeAdapter(), "")
 	if err != nil {
@@ -647,7 +652,11 @@ func TestInjectOpenCodePreservesExistingOrchestratorPromptWhenRequested(t *testi
 		"**Trivial diff**",
 		"zero executable code and zero configuration changes",
 		"run exactly ONE lens",
+		"Large pure human documentation",
+		"run only `review-readability`",
 		"Full 4R is reserved for tier 3",
+		"after a fix rerun only the originating lens(es)",
+		"Native ordinary review keeps its targeted validator",
 		"`review-readability`",
 		"`review-reliability`",
 		"`review-resilience`",
@@ -5661,7 +5670,7 @@ func TestInjectOpenCodeWithProfile_StaleJDCleanupAcceptsJSONCSettings(t *testing
 	}
 }
 
-func TestInjectOpenCodeWithProfile_StaleJDCleanupDoesNotRejectMalformedSettings(t *testing.T) {
+func TestInjectOpenCodeRejectsMalformedSettingsBeforeWrites(t *testing.T) {
 	home := t.TempDir()
 	mockNoPackageManager(t)
 
@@ -5677,20 +5686,16 @@ func TestInjectOpenCodeWithProfile_StaleJDCleanupDoesNotRejectMalformedSettings(
 		Name:              "cheap",
 		OrchestratorModel: model.ModelAssignment{ProviderID: "anthropic", ModelID: "claude-haiku-3-5"},
 	}
-	if _, err := Inject(home, opencodeAdapter(), model.SDDModeMulti, InjectOptions{Profiles: []model.Profile{profileWithoutJD}}); err != nil {
-		t.Fatalf("Inject() should preserve merge behavior for malformed opencode settings: %v", err)
+	before, _ := os.ReadFile(settingsPath)
+	if _, err := Inject(home, opencodeAdapter(), model.SDDModeMulti, InjectOptions{Profiles: []model.Profile{profileWithoutJD}}); err == nil {
+		t.Fatal("Inject() accepted malformed opencode settings")
 	}
-
-	content, err := os.ReadFile(settingsPath)
-	if err != nil {
-		t.Fatalf("ReadFile(opencode.json): %v", err)
+	after, _ := os.ReadFile(settingsPath)
+	if !bytes.Equal(before, after) {
+		t.Fatalf("malformed settings changed: %q", after)
 	}
-	var root map[string]any
-	if err := json.Unmarshal(content, &root); err != nil {
-		t.Fatalf("opencode.json should be recovered as valid JSON: %v", err)
-	}
-	if _, ok := root["agent"].(map[string]any)["sdd-orchestrator-cheap"]; !ok {
-		t.Fatal("profile orchestrator missing after malformed settings recovery")
+	if _, err := os.Stat(filepath.Join(home, ".config", "opencode", "commands")); !os.IsNotExist(err) {
+		t.Fatalf("commands were written before settings validation: %v", err)
 	}
 }
 
@@ -7008,6 +7013,77 @@ func TestMigrateLegacyOpenCodeCommandPromptNoOp(t *testing.T) {
 		}
 		if string(out) != in {
 			t.Fatalf("input %q mutated to %q, want unchanged", in, string(out))
+		}
+	}
+}
+
+// TestRefreshInstalledOpenCodePluginsSkipsSymlinksAndDirectories pins the
+// Lstat safety property of RefreshInstalledOpenCodePlugins: only regular
+// files at managed plugin paths are refreshed. A symlink must be skipped
+// without following it (the user-owned target must stay untouched) and a
+// directory at a plugin path must be left alone.
+func TestRefreshInstalledOpenCodePluginsSkipsSymlinksAndDirectories(t *testing.T) {
+	home := t.TempDir()
+	pluginsDir := filepath.Join(home, ".config", "opencode", "plugins")
+	if err := os.MkdirAll(pluginsDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(plugins) error = %v", err)
+	}
+
+	// Symlink at a managed plugin path, pointing at a user file.
+	userFile := filepath.Join(home, "user-owned.ts")
+	userContent := []byte("// user-owned content, must never be overwritten")
+	if err := os.WriteFile(userFile, userContent, 0o644); err != nil {
+		t.Fatalf("WriteFile(user file) error = %v", err)
+	}
+	symlinkPath := filepath.Join(pluginsDir, "review-result-artifacts.ts")
+	if err := os.Symlink(userFile, symlinkPath); err != nil {
+		t.Skipf("symlinks not supported on this platform: %v", err)
+	}
+
+	// Directory at a managed plugin path.
+	dirPath := filepath.Join(pluginsDir, "model-variants.ts")
+	if err := os.MkdirAll(dirPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(dir plugin path) error = %v", err)
+	}
+
+	// Stale regular file — the only one that must be refreshed.
+	regularPath := filepath.Join(pluginsDir, "skill-registry.ts")
+	if err := os.WriteFile(regularPath, []byte("// stale"), 0o644); err != nil {
+		t.Fatalf("WriteFile(regular plugin) error = %v", err)
+	}
+
+	result, err := RefreshInstalledOpenCodePlugins(home, opencodeAdapter())
+	if err != nil {
+		t.Fatalf("RefreshInstalledOpenCodePlugins() error = %v", err)
+	}
+
+	// Symlink stays a symlink and its target is untouched.
+	if info, lerr := os.Lstat(symlinkPath); lerr != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("symlink plugin path must remain a symlink; info = %v, err = %v", info, lerr)
+	}
+	if got, rerr := os.ReadFile(userFile); rerr != nil || !bytes.Equal(got, userContent) {
+		t.Errorf("symlink target was modified: content = %q, err = %v", got, rerr)
+	}
+
+	// Directory stays a directory.
+	if info, serr := os.Lstat(dirPath); serr != nil || !info.IsDir() {
+		t.Errorf("directory plugin path must remain a directory; info = %v, err = %v", info, serr)
+	}
+
+	// Regular stale file is refreshed byte-equal to the embedded asset.
+	got, rerr := os.ReadFile(regularPath)
+	if rerr != nil {
+		t.Fatalf("ReadFile(regular plugin) error = %v", rerr)
+	}
+	if string(got) != assets.MustRead("opencode/plugins/skill-registry.ts") {
+		t.Errorf("regular stale plugin was not refreshed to the embedded asset")
+	}
+	if !result.Changed {
+		t.Errorf("result.Changed = false, want true (regular plugin refreshed)")
+	}
+	for _, file := range result.Files {
+		if file == symlinkPath || file == dirPath {
+			t.Errorf("result.Files must not report skipped path %q; files = %v", file, result.Files)
 		}
 	}
 }

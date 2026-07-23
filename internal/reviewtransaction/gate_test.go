@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -65,7 +66,7 @@ func TestPrePRGateFailsClosedForUnprovenBaseAdvance(t *testing.T) {
 		mutate       func(t *testing.T, fixture *compatiblePrePRFixture)
 		want         GateResult
 	}{
-		{name: "missing attestation", mutate: func(t *testing.T, fixture *compatiblePrePRFixture) { fixture.request.PrePR = nil }, want: GateScopeChanged},
+		{name: "missing attestation", mutate: func(t *testing.T, fixture *compatiblePrePRFixture) { fixture.request.PrePR.CIAttestationArtifact = "" }, want: GateScopeChanged},
 		{name: "missing receipt-bound trust policy", mutate: func(t *testing.T, fixture *compatiblePrePRFixture) { fixture.request.PolicyArtifact = "" }, want: GateScopeChanged},
 		{name: "invalid signature", mutate: func(t *testing.T, fixture *compatiblePrePRFixture) {
 			fixture.attestation.Signature = base64.StdEncoding.EncodeToString(make([]byte, ed25519.SignatureSize))
@@ -156,6 +157,11 @@ func TestPrePRGateRechecksMovingPublicationInputs(t *testing.T) {
 		{name: "remote base moves", mutate: func(t *testing.T, fixture *compatiblePrePRFixture) {
 			gitSnapshot(t, fixture.repo, "--git-dir", fixture.remote, "update-ref", "refs/heads/main", fixture.originalBaseCommit)
 		}},
+		{name: "remote URL redirects to same commits", mutate: func(t *testing.T, fixture *compatiblePrePRFixture) {
+			redirect := filepath.Join(t.TempDir(), "redirect.git")
+			gitSnapshot(t, fixture.repo, "clone", "--bare", fixture.remote, redirect)
+			gitSnapshot(t, fixture.repo, "remote", "set-url", "origin", redirect)
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -173,7 +179,7 @@ func TestPrePRGateRechecksMovingPublicationInputs(t *testing.T) {
 	}
 }
 
-func TestExplicitPrePRRequestWithoutRemotePreservesUnchangedBase(t *testing.T) {
+func TestExplicitPrePRRequestWithoutRemoteFailsClosed(t *testing.T) {
 	repo := initSnapshotRepo(t)
 	baseCommit := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
 	gitSnapshot(t, repo, "branch", "main", baseCommit)
@@ -223,8 +229,228 @@ func TestExplicitPrePRRequestWithoutRemotePreservesUnchangedBase(t *testing.T) {
 		PolicyArtifact: policyPath, LedgerArtifact: ledgerPath, EvidenceArtifact: evidencePath,
 	}
 	bindGateRequestToStore(t, &request, store)
-	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateAllow || got.Context.BaseAdvance != nil {
-		t.Fatalf("unchanged explicit PRE-PR request = %#v", got)
+	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateInvalidated || !strings.Contains(got.Reason, "--base-ref") {
+		t.Fatalf("unadvertised explicit PRE-PR request = %#v", got)
+	}
+}
+
+func TestSelectPrePRBoundaryUsesExactExplicitOrPublicationDefaultCommit(t *testing.T) {
+	fixture := newCompatiblePrePRFixture(t, "delivery.txt", "base-only.txt")
+
+	tests := []struct {
+		name     string
+		selector string
+		want     PrePRBoundarySelection
+	}{
+		{
+			name:     "explicit current chained base",
+			selector: "origin/reviewed-base",
+			want: PrePRBoundarySelection{
+				Source: PrePRBoundaryExplicit, Selector: "origin/reviewed-base", Commit: fixture.originalBaseCommit, Remote: "origin", RemoteRef: "refs/heads/reviewed-base",
+			},
+		},
+		{
+			name: "publication default without selector",
+			want: PrePRBoundarySelection{
+				Source: PrePRBoundaryPublicationDefault, Selector: "refs/heads/main", Commit: trimGit(gitSnapshot(t, fixture.repo, "rev-parse", "main")), Remote: "origin", RemoteRef: "refs/heads/main",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := selectPrePRBoundary(context.Background(), fixture.repo, tt.selector)
+			got.RemoteIdentity = ""
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("selectPrePRBoundary(%q) = %#v, want %#v", tt.selector, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDefaultBoundariesSeparatePrePRTargetFromPrePushTracking(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	base := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	gitSnapshot(t, repo, "branch", "main", base)
+	gitSnapshot(t, repo, "branch", "feature", base)
+	configurePublicationRemote(t, repo, "main")
+	gitSnapshot(t, repo, "checkout", "feature")
+	gitSnapshot(t, repo, "config", "branch.feature.remote", "origin")
+	gitSnapshot(t, repo, "config", "branch.feature.merge", "refs/heads/feature")
+
+	prePR, err := selectPrePRBoundary(context.Background(), repo, "")
+	if err != nil || prePR.RemoteRef != "refs/heads/main" {
+		t.Fatalf("default PRE-PR boundary = %#v, %v", prePR, err)
+	}
+	_, prePush, err := buildPushTarget(context.Background(), repo, "", "", "")
+	if err != nil || prePush.Boundary.RemoteRef != "refs/heads/feature" {
+		t.Fatalf("default PRE-PUSH boundary = %#v, %v", prePush, err)
+	}
+}
+
+func TestSelectPrePRBoundaryRejectsAbsolutePathLikeSelector(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	if _, err := selectPrePRBoundary(context.Background(), repo, filepath.Join(repo, "outside")); err == nil {
+		t.Fatal("absolute path-like selector was accepted")
+	}
+}
+
+func TestSelectPrePRBoundaryRejectsAdvertisedUnrelatedSameTree(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	remote := configurePublicationRemote(t, repo, branch)
+	writeSnapshotFile(t, repo, "delivery.txt", "delivery\n")
+	gitSnapshot(t, repo, "add", "delivery.txt")
+	gitSnapshot(t, repo, "commit", "-m", "delivery")
+	wantTree := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}"))
+	if _, err := selectPrePRBoundary(context.Background(), repo, "origin/"+branch); err != nil {
+		t.Fatalf("valid chained base rejected: %v", err)
+	}
+
+	gitSnapshot(t, repo, "checkout", "--orphan", "unrelated")
+	gitSnapshot(t, repo, "commit", "-m", "unrelated same tree")
+	if got := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}")); got != wantTree {
+		t.Fatalf("unrelated tree = %s, want %s", got, wantTree)
+	}
+	gitSnapshot(t, repo, "push", remote, "HEAD:refs/heads/unrelated")
+	gitSnapshot(t, repo, "checkout", branch)
+	if _, err := selectPrePRBoundary(context.Background(), repo, "origin/unrelated"); err == nil || !strings.Contains(err.Error(), "0 merge bases") {
+		t.Fatalf("advertised unrelated same-tree base error = %v", err)
+	}
+}
+
+func TestSelectPrePRBoundaryUsesRepositoryRootForSubdirectories(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	want := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	branch := currentBranch(context.Background(), repo)
+	configurePublicationRemote(t, repo, branch)
+	subdirectory := filepath.Join(repo, "nested", "work")
+	if err := os.MkdirAll(subdirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, location := range []string{repo, subdirectory} {
+		selection, err := selectPrePRBoundary(context.Background(), location, "origin/"+branch)
+		if err != nil || selection.Source != PrePRBoundaryExplicit || selection.Commit != want {
+			t.Fatalf("selectPrePRBoundary(%q) = %#v, %v", location, selection, err)
+		}
+	}
+}
+
+func TestBuildNativePrePRRequestKeepsExplicitReviewedBaseWhenDefaultAdvanced(t *testing.T) {
+	fixture := newCompatiblePrePRFixture(t, "delivery.txt", "base-only.txt")
+
+	request, err := BuildNativeGateRequest(context.Background(), fixture.repo, NativeGateRequestInput{
+		Gate: GatePrePR, LineageID: fixture.receipt.LineageID, BaseRef: "origin/reviewed-base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Target.BaseRef != fixture.originalBaseCommit || request.PrePR == nil || request.PrePR.Boundary == nil || *request.PrePR.Boundary != (PrePRBoundarySelection{
+		Source: PrePRBoundaryExplicit, Selector: "origin/reviewed-base", Commit: fixture.originalBaseCommit, Remote: "origin", RemoteRef: "refs/heads/reviewed-base", RemoteIdentity: request.PrePR.Boundary.RemoteIdentity,
+	}) {
+		t.Fatalf("explicit pre-PR request = %#v", request)
+	}
+	if evaluation := EvaluateNativeGate(context.Background(), fixture.repo, fixture.receipt, request); evaluation.Result != GateAllow || evaluation.Context.PrePRBoundary == nil || *evaluation.Context.PrePRBoundary != *request.PrePR.Boundary {
+		t.Fatalf("explicit pre-PR evaluation = %#v", evaluation)
+	}
+}
+
+func TestNativePrePRGateInvalidatesWhenExplicitSelectorMoves(t *testing.T) {
+	fixture := newCompatiblePrePRFixture(t, "delivery.txt", "base-only.txt")
+	request, err := BuildNativeGateRequest(context.Background(), fixture.repo, NativeGateRequestInput{
+		Gate: GatePrePR, LineageID: fixture.receipt.LineageID, BaseRef: "main",
+		PolicyArtifact: fixture.request.PolicyArtifact, LedgerArtifact: fixture.request.LedgerArtifact,
+		EvidenceArtifact: fixture.request.EvidenceArtifact, PrePRCIAttestation: fixture.attestationPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalHook := finalGateAuthorizationHook
+	finalGateAuthorizationHook = func() {
+		finalGateAuthorizationHook = originalHook
+		gitSnapshot(t, fixture.repo, "--git-dir", fixture.remote, "update-ref", "refs/heads/main", fixture.originalBaseCommit)
+	}
+	t.Cleanup(func() { finalGateAuthorizationHook = originalHook })
+
+	if got := EvaluateNativeGate(context.Background(), fixture.repo, fixture.receipt, request); got.Result != GateInvalidated {
+		t.Fatalf("moving explicit selector = %#v", got)
+	}
+}
+
+func TestNativePrePRGateInvalidatesWhenCommitAMovesHead(t *testing.T) {
+	fixture := newCompatiblePrePRFixture(t, "delivery.txt", "base-only.txt")
+	request, err := BuildNativeGateRequest(context.Background(), fixture.repo, NativeGateRequestInput{
+		Gate: GatePrePR, LineageID: fixture.receipt.LineageID, BaseRef: "origin/reviewed-base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalHook := finalGateAuthorizationHook
+	finalGateAuthorizationHook = func() {
+		finalGateAuthorizationHook = originalHook
+		writeSnapshotFile(t, fixture.repo, fixture.deliveryPath, "changed after review\n")
+		gitSnapshot(t, fixture.repo, "commit", "-am", "move head")
+	}
+	t.Cleanup(func() { finalGateAuthorizationHook = originalHook })
+
+	if got := EvaluateNativeGate(context.Background(), fixture.repo, fixture.receipt, request); got.Result != GateInvalidated {
+		t.Fatalf("commit -a head movement = %#v", got)
+	}
+}
+
+func TestNativePrePRGateIgnoresStagedAndEmptyIndexState(t *testing.T) {
+	fixture := newCompatiblePrePRFixture(t, "delivery.txt", "base-only.txt")
+	request, err := BuildNativeGateRequest(context.Background(), fixture.repo, NativeGateRequestInput{
+		Gate: GatePrePR, LineageID: fixture.receipt.LineageID, BaseRef: "origin/reviewed-base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSnapshotFile(t, fixture.repo, "staged-only.txt", "index does not authorize\n")
+	gitSnapshot(t, fixture.repo, "add", "staged-only.txt")
+	if staged := EvaluateNativeGate(context.Background(), fixture.repo, fixture.receipt, request); staged.Result != GateAllow || staged.Context.CandidateTree != fixture.receipt.FinalCandidateTree {
+		t.Fatalf("staged-only pre-PR gate = %#v", staged)
+	}
+	gitSnapshot(t, fixture.repo, "reset", "--", "staged-only.txt")
+	if empty := EvaluateNativeGate(context.Background(), fixture.repo, fixture.receipt, request); empty.Result != GateAllow || empty.Context.CandidateTree != fixture.receipt.FinalCandidateTree {
+		t.Fatalf("empty-index pre-PR gate = %#v", empty)
+	}
+}
+
+func TestNativePrePRGateDenialRetainsAuthorityAndObservedBoundary(t *testing.T) {
+	fixture := newCompatiblePrePRFixture(t, "delivery.txt", "base-only.txt")
+	request, err := BuildNativeGateRequest(context.Background(), fixture.repo, NativeGateRequestInput{
+		Gate: GatePrePR, LineageID: fixture.receipt.LineageID, BaseRef: "origin/reviewed-base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.PrePR.Boundary.Selector = "missing-reviewed-base"
+
+	got := EvaluateNativeGate(context.Background(), fixture.repo, fixture.receipt, request)
+	if got.Result != GateInvalidated || got.Context.LineageID != fixture.receipt.LineageID || got.Context.PrePRBoundary == nil || got.Context.PrePRBoundary.Selector != "missing-reviewed-base" || got.Context.Denial == nil || got.Context.Denial.Stage != "boundary-selection" || got.Context.Denial.Code != "unavailable" {
+		t.Fatalf("unavailable explicit boundary = %#v", got)
+	}
+}
+
+func TestNativePrePRGateAnnotatesReceiptBindingDenial(t *testing.T) {
+	fixture := newCompatiblePrePRFixture(t, "delivery.txt", "base-only.txt")
+	request, err := BuildNativeGateRequest(context.Background(), fixture.repo, NativeGateRequestInput{
+		Gate: GatePrePR, LineageID: fixture.receipt.LineageID, BaseRef: "main",
+		PolicyArtifact: fixture.request.PolicyArtifact, LedgerArtifact: fixture.request.LedgerArtifact,
+		EvidenceArtifact: fixture.request.EvidenceArtifact, PrePRCIAttestation: fixture.attestationPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSnapshotFile(t, fixture.repo, fixture.deliveryPath, "changed delivery\n")
+	gitSnapshot(t, fixture.repo, "commit", "-am", "change delivery")
+	got := EvaluateNativeGate(context.Background(), fixture.repo, fixture.receipt, request)
+	if got.Result == GateAllow || got.Context.PrePRBoundary == nil || got.Context.Denial == nil || got.Context.Denial.Stage != "receipt-binding" {
+		t.Fatalf("receipt-binding denial = %#v", got)
 	}
 }
 
@@ -246,8 +472,354 @@ func TestPublicationRemoteUsesGitPushPrecedence(t *testing.T) {
 	}
 }
 
+func TestPublicationRemotePreservesTrackingFirstPushAndExplicitRefspecAuthority(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		configure func(t *testing.T, repo, branch string)
+		want      string
+	}{
+		{
+			name: "tracking branch", want: "tracking",
+			configure: func(t *testing.T, repo, branch string) {
+				gitSnapshot(t, repo, "remote", "add", "tracking", filepath.Join(t.TempDir(), "tracking.git"))
+				gitSnapshot(t, repo, "config", "branch."+branch+".remote", "tracking")
+			},
+		},
+		{
+			name: "first push configuration", want: "publish",
+			configure: func(t *testing.T, repo, branch string) {
+				gitSnapshot(t, repo, "remote", "add", "publish", filepath.Join(t.TempDir(), "publish.git"))
+				gitSnapshot(t, repo, "config", "branch."+branch+".pushRemote", "publish")
+			},
+		},
+		{
+			name: "explicit refspec retains origin", want: "origin",
+			configure: func(t *testing.T, repo, _ string) {
+				gitSnapshot(t, repo, "remote", "add", "origin", filepath.Join(t.TempDir(), "origin.git"))
+				gitSnapshot(t, repo, "config", "remote.origin.push", "refs/heads/main:refs/heads/main")
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := initSnapshotRepo(t)
+			branch := strings.TrimSpace(gitSnapshot(t, repo, "symbolic-ref", "--short", "HEAD"))
+			tt.configure(t, repo, branch)
+			got, configured, err := publicationRemote(context.Background(), repo)
+			if err != nil || !configured || got != tt.want {
+				t.Fatalf("publicationRemote() = %q, %v, %v; want %q", got, configured, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestPublicationTargetBindsAdvertisedUpstreamSeparatelyFromPushRemote(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	base := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	upstream, origin := filepath.Join(t.TempDir(), "upstream.git"), filepath.Join(t.TempDir(), "origin.git")
+	gitSnapshot(t, repo, "clone", "--bare", repo, upstream)
+	gitSnapshot(t, repo, "clone", "--bare", repo, origin)
+	gitSnapshot(t, repo, "--git-dir", upstream, "branch", "main", base)
+	gitSnapshot(t, repo, "remote", "add", "upstream", upstream)
+	gitSnapshot(t, repo, "remote", "add", "origin", origin)
+	gitSnapshot(t, repo, "config", "branch."+branch+".remote", "upstream")
+	gitSnapshot(t, repo, "config", "branch."+branch+".merge", "refs/heads/main")
+	gitSnapshot(t, repo, "config", "branch."+branch+".pushRemote", "origin")
+
+	writeSnapshotFile(t, repo, "one.txt", "one\n")
+	gitSnapshot(t, repo, "add", "one.txt")
+	gitSnapshot(t, repo, "commit", "-m", "one")
+	target, push, err := buildPushTarget(context.Background(), repo, "", "", "")
+	if err != nil || target.BaseRef != base || push.Boundary.Remote != "upstream" || push.PushRemote != "origin" {
+		t.Fatalf("one-commit fork target = %#v, %#v, %v", target, push, err)
+	}
+	_, refs, err := prePushTargetForRequest(context.Background(), repo, GateRequest{Gate: GatePrePush, Target: target, Push: push})
+	if err != nil || refs.DeliveredCommitCount != 1 {
+		t.Fatalf("one delivered commit = %#v, %v", refs, err)
+	}
+	writeSnapshotFile(t, repo, "two.txt", "two\n")
+	gitSnapshot(t, repo, "add", "two.txt")
+	gitSnapshot(t, repo, "commit", "-m", "two")
+	_, refs, err = prePushTargetForRequest(context.Background(), repo, GateRequest{Gate: GatePrePush})
+	if err != nil || refs.DeliveredCommitCount != 2 {
+		t.Fatalf("two delivered commits = %#v, %v", refs, err)
+	}
+	selection, err := selectPrePRBoundary(context.Background(), repo, "upstream/main")
+	if err != nil || selection.Remote != "upstream" || selection.Commit != base {
+		t.Fatalf("explicit chained base = %#v, %v", selection, err)
+	}
+	gitSnapshot(t, repo, "--git-dir", origin, "branch", "main", base)
+	if _, err := selectPrePRBoundary(context.Background(), repo, "main"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous explicit selector error = %v", err)
+	}
+	gitSnapshot(t, repo, "branch", "stale-local", base)
+	for _, selector := range []string{"stale-local", trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))} {
+		if _, err := selectPrePRBoundary(context.Background(), repo, selector); err == nil {
+			t.Fatalf("unadvertised selector %q was accepted", selector)
+		}
+	}
+	frozen := *push
+	gitSnapshot(t, repo, "push", "upstream", "HEAD:refs/heads/main")
+	if _, _, err := prePushTargetForRequest(context.Background(), repo, GateRequest{Gate: GatePrePush, Target: target, Push: &frozen}); err == nil {
+		t.Fatal("advertised upstream advance preserved stale authorization")
+	}
+	gitSnapshot(t, repo, "config", "--unset", "branch."+branch+".merge")
+	if _, _, err := buildPushTarget(context.Background(), repo, "", "", ""); err == nil || !strings.Contains(err.Error(), "--base-ref") {
+		t.Fatalf("missing upstream error = %v", err)
+	}
+}
+
+func TestPrePushRefsKeepReviewedAndTrackingBoundariesIndependent(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	base := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	remote := configurePublicationRemote(t, repo, branch)
+	gitSnapshot(t, repo, "config", "branch."+branch+".remote", "origin")
+	gitSnapshot(t, repo, "config", "branch."+branch+".merge", "refs/heads/"+branch)
+	gitSnapshot(t, repo, "--git-dir", remote, "branch", "reviewed-base", base)
+	writeSnapshotFile(t, repo, "upstream.txt", "tracking advance\n")
+	gitSnapshot(t, repo, "add", "upstream.txt")
+	gitSnapshot(t, repo, "commit", "-m", "tracking advance")
+	tracking := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	gitSnapshot(t, repo, "push", "origin", "HEAD:refs/heads/"+branch)
+	writeSnapshotFile(t, repo, "approved.txt", "reviewed delivery\n")
+	gitSnapshot(t, repo, "add", "approved.txt")
+	gitSnapshot(t, repo, "commit", "-m", "reviewed delivery")
+
+	target, push, err := buildPushTarget(context.Background(), repo, "origin/reviewed-base", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, refs, err := prePushTargetForRequest(context.Background(), repo, GateRequest{Gate: GatePrePush, Target: target, Push: push})
+	if err != nil || refs.Selection.Commit != base || !refs.TrackingPresent || refs.TrackingBoundary.Commit != tracking {
+		t.Fatalf("independent reviewed/tracking refs = %#v, %v", refs, err)
+	}
+}
+
+func TestExplicitPrePushBaseAllowsAbsentTracking(t *testing.T) {
+	for _, detached := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing", true: "detached"}[detached], func(t *testing.T) {
+			repo := initSnapshotRepo(t)
+			branch := currentBranch(context.Background(), repo)
+			configurePublicationRemote(t, repo, branch)
+			if detached {
+				gitSnapshot(t, repo, "checkout", "--detach")
+			}
+			target, push, err := buildPushTarget(context.Background(), repo, "origin/"+branch, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, refs, err := prePushTargetForRequest(context.Background(), repo, GateRequest{Gate: GatePrePush, Target: target, Push: push})
+			if err != nil || refs.TrackingPresent {
+				t.Fatalf("explicit base with absent tracking = %#v, %v", refs, err)
+			}
+		})
+	}
+}
+
+func TestDefaultPrePushBaseReportsTypedTargetResolution(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		prepare func(*testing.T, string, string)
+	}{
+		{name: "missing upstream"},
+		{name: "detached head", prepare: func(t *testing.T, repo, _ string) {
+			gitSnapshot(t, repo, "checkout", "--detach")
+		}},
+		{name: "non-branch upstream", prepare: func(t *testing.T, repo, branch string) {
+			configurePublicationRemote(t, repo, branch)
+			gitSnapshot(t, repo, "config", "branch."+branch+".remote", "origin")
+			gitSnapshot(t, repo, "config", "branch."+branch+".merge", "refs/tags/not-a-branch")
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := initSnapshotRepo(t)
+			branch := currentBranch(context.Background(), repo)
+			if tt.prepare != nil {
+				tt.prepare(t, repo, branch)
+			}
+			_, _, _, err := resolveTrackingUpstreamBase(context.Background(), repo)
+			var targetErr *GateTargetResolutionError
+			if !errors.As(err, &targetErr) || targetErr.RequiredInput != "base_ref" || !strings.Contains(err.Error(), "--base-ref") {
+				t.Fatalf("target resolution error = %T %v", err, err)
+			}
+		})
+	}
+}
+
+func TestDefaultPrePushBaseKeepsInfrastructureErrorsUntyped(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, _, err := resolveTrackingUpstreamBase(ctx, repo)
+	var targetErr *GateTargetResolutionError
+	if !errors.Is(err, context.Canceled) || errors.As(err, &targetErr) {
+		t.Fatalf("cancelled target resolution error = %T %v", err, err)
+	}
+	_, _, _, upstreamErr := configuredUpstreamRef(ctx, repo, branch)
+	if !errors.Is(upstreamErr, context.Canceled) || errors.As(upstreamErr, &targetErr) {
+		t.Fatalf("cancelled upstream lookup error = %T %v", upstreamErr, upstreamErr)
+	}
+}
+
+func TestExplicitPrePushBasePropagatesConfiguredTrackingResolutionError(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	configurePublicationRemote(t, repo, branch)
+	gitSnapshot(t, repo, "remote", "add", "tracking", filepath.Join(t.TempDir(), "missing.git"))
+	gitSnapshot(t, repo, "config", "branch."+branch+".remote", "tracking")
+	gitSnapshot(t, repo, "config", "branch."+branch+".merge", "refs/heads/main")
+	gitSnapshot(t, repo, "config", "branch."+branch+".pushRemote", "origin")
+	target, push, err := buildPushTarget(context.Background(), repo, "origin/"+branch, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = prePushTargetForRequest(context.Background(), repo, GateRequest{Gate: GatePrePush, Target: target, Push: push})
+	var gitErr *GitCommandError
+	if !errors.As(err, &gitErr) {
+		t.Fatalf("configured tracking resolution error = %T %v", err, err)
+	}
+}
+
+func TestExplicitPrePushBasePropagatesTrackingContextCancellation(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := resolvePrePushTrackingBoundary(ctx, repo, PrePRBoundarySelection{Source: PrePRBoundaryExplicit})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("tracking context cancellation = %T %v", err, err)
+	}
+}
+
+func TestPrePushFinalAuthorizationRechecksTrackingBesidesExplicitBase(t *testing.T) {
+	repo, receipt, artifacts := approvedCurrentChangesGateFixture(t, "pre-push-tracking-recheck")
+	branch := currentBranch(context.Background(), repo)
+	reviewed := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	remote := trimGit(gitSnapshot(t, repo, "remote", "get-url", "origin"))
+	gitSnapshot(t, repo, "branch", "reviewed-base", reviewed)
+	gitSnapshot(t, repo, "push", "origin", "reviewed-base:refs/heads/reviewed-base")
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "reviewed delivery")
+	request, err := BuildNativeGateRequest(context.Background(), repo, NativeGateRequestInput{
+		Gate: GatePrePush, LineageID: receipt.LineageID, BaseRef: "origin/reviewed-base",
+		PolicyArtifact: artifacts.PolicyArtifact, LedgerArtifact: artifacts.LedgerArtifact, EvidenceArtifact: artifacts.EvidenceArtifact,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, refs, err := prePushTargetForRequest(context.Background(), repo, request)
+	if err != nil || !refs.TrackingPresent || refs.TrackingBoundary.Commit == refs.Selection.Commit {
+		t.Fatalf("distinct frozen tracking setup = %#v, %v", refs, err)
+	}
+
+	originalHook := finalGateAuthorizationHook
+	finalGateAuthorizationHook = func() {
+		finalGateAuthorizationHook = originalHook
+		gitSnapshot(t, repo, "--git-dir", remote, "update-ref", "refs/heads/"+branch, reviewed)
+	}
+	t.Cleanup(func() { finalGateAuthorizationHook = originalHook })
+	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateInvalidated || !strings.Contains(got.Reason, "final authorization") {
+		t.Fatalf("moving tracking boundary = %#v", got)
+	}
+}
+
+func TestPrePushFinalAuthorizationRejectsEmptyHeadAdvanceWithGateParity(t *testing.T) {
+	legacyRepo, legacyReceipt, legacyRequest := approvedCurrentChangesGateFixture(t, "legacy-empty-final-head")
+	gitSnapshot(t, legacyRepo, "add", "tracked.txt")
+	gitSnapshot(t, legacyRepo, "commit", "-m", "delivery")
+	legacyRequest = nativePrePushRequest(t, legacyRepo, legacyReceipt, legacyRequest)
+
+	compactRepo := initSnapshotRepo(t)
+	branch := currentBranch(context.Background(), compactRepo)
+	configurePublicationRemote(t, compactRepo, branch)
+	gitSnapshot(t, compactRepo, "config", "branch."+branch+".remote", "origin")
+	gitSnapshot(t, compactRepo, "config", "branch."+branch+".merge", "refs/heads/"+branch)
+	writeSnapshotFile(t, compactRepo, "tracked.txt", "reviewed delivery\n")
+	state, _, compactReceipt := approvedCompactCurrentChangesFixture(t, compactRepo, "compact-empty-final-head", []string{})
+	gitSnapshot(t, compactRepo, "add", "tracked.txt")
+	gitSnapshot(t, compactRepo, "commit", "-m", "delivery")
+
+	for _, tt := range []struct {
+		name string
+		repo string
+		run  func() NativeGateEvaluation
+	}{
+		{name: "legacy", repo: legacyRepo, run: func() NativeGateEvaluation {
+			return EvaluateNativeGate(context.Background(), legacyRepo, legacyReceipt, legacyRequest)
+		}},
+		{name: "compact", repo: compactRepo, run: func() NativeGateEvaluation {
+			return EvaluateCompactGate(context.Background(), compactRepo, compactReceipt, NativeGateRequestInput{Gate: GatePrePush, LineageID: state.LineageID})
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			originalHook := finalGateAuthorizationHook
+			finalGateAuthorizationHook = func() { gitSnapshot(t, tt.repo, "commit", "--allow-empty", "-m", "concurrent empty") }
+			t.Cleanup(func() { finalGateAuthorizationHook = originalHook })
+			if got := tt.run(); got.Result != GateInvalidated || !strings.Contains(got.Reason, "final authorization") {
+				t.Fatalf("empty final HEAD advance = %#v", got)
+			}
+			finalGateAuthorizationHook = originalHook
+		})
+	}
+}
+
+func TestPrePushRejectsHiddenCommitsBeforeReviewedDelivery(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		hidden func(t *testing.T, repo string)
+	}{
+		{name: "empty", hidden: func(t *testing.T, repo string) {
+			gitSnapshot(t, repo, "commit", "--allow-empty", "-m", "hidden empty")
+		}},
+		{name: "change and revert", hidden: func(t *testing.T, repo string) {
+			writeSnapshotFile(t, repo, "hidden.txt", "hidden\n")
+			gitSnapshot(t, repo, "add", "hidden.txt")
+			gitSnapshot(t, repo, "commit", "-m", "hidden change")
+			gitSnapshot(t, repo, "revert", "--no-edit", "HEAD")
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, receipt, request := approvedCurrentChangesGateFixture(t, "hidden-"+strings.ReplaceAll(tt.name, " ", "-"))
+			tt.hidden(t, repo)
+			gitSnapshot(t, repo, "add", "tracked.txt")
+			gitSnapshot(t, repo, "commit", "-m", "reviewed delivery")
+			if _, err := BuildNativeGateRequest(context.Background(), repo, NativeGateRequestInput{Gate: GatePrePush, LineageID: receipt.LineageID, PolicyArtifact: request.PolicyArtifact, LedgerArtifact: request.LedgerArtifact, EvidenceArtifact: request.EvidenceArtifact}); err == nil {
+				t.Fatal("hidden publication commits were accepted")
+			}
+		})
+	}
+}
+
+func TestPushIdentityUsesPushURLAndRechecksIt(t *testing.T) {
+	repo, receipt, artifacts := approvedCurrentChangesGateFixture(t, "pushurl-recheck")
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "reviewed delivery")
+	redirect := filepath.Join(t.TempDir(), "redirect.git")
+	gitSnapshot(t, repo, "clone", "--bare", repo, redirect)
+	gitSnapshot(t, repo, "config", "remote.origin.pushurl", redirect)
+	request := nativePrePushRequest(t, repo, receipt, artifacts)
+	fetchIdentity, _ := remoteRepositoryIdentity(context.Background(), repo, "origin")
+	pushIdentity, _ := pushRepositoryIdentity(context.Background(), repo, "origin")
+	if request.Push.PushRemoteIdentity != pushIdentity || pushIdentity == fetchIdentity || !strings.HasPrefix(pushIdentity, "sha256:") {
+		t.Fatalf("push identity = %q, fetch identity = %q, request = %#v", pushIdentity, fetchIdentity, request.Push)
+	}
+	originalHook := finalGateAuthorizationHook
+	finalGateAuthorizationHook = func() {
+		gitSnapshot(t, repo, "config", "remote.origin.pushurl", filepath.Join(t.TempDir(), "changed.git"))
+	}
+	t.Cleanup(func() { finalGateAuthorizationHook = originalHook })
+	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateInvalidated || !strings.Contains(got.Reason, "final authorization") {
+		t.Fatalf("changed pushurl evaluation = %#v", got)
+	}
+}
+
 func TestCanonicalCorrectedRequestPreservesExplicitNativeParity(t *testing.T) {
 	repo := initSnapshotRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	configurePublicationRemote(t, repo, branch)
+	gitSnapshot(t, repo, "config", "branch."+branch+".remote", "origin")
+	gitSnapshot(t, repo, "config", "branch."+branch+".merge", "refs/heads/"+branch)
 	fixture := correctedBundleFixture(t, repo, "corrected-request-parity")
 	fixPayload, err := json.Marshal(fixture.Transaction.Snapshot)
 	if err != nil {
@@ -318,6 +890,9 @@ func newCompatiblePrePRFixtureMode(t *testing.T, deliveryPath, basePath string, 
 	gitSnapshot(t, repo, "branch", "main", baseCommit)
 	remote := configurePublicationRemote(t, repo, "main")
 	gitSnapshot(t, repo, "checkout", "-qb", "feature")
+	gitSnapshot(t, repo, "config", "branch.feature.remote", "origin")
+	gitSnapshot(t, repo, "config", "branch.feature.merge", "refs/heads/main")
+	gitSnapshot(t, repo, "--git-dir", remote, "branch", "reviewed-base", baseCommit)
 	writeSnapshotFile(t, repo, deliveryPath, "reviewed delivery\n")
 	gitSnapshot(t, repo, "add", "--", deliveryPath)
 	gitSnapshot(t, repo, "commit", "-m", "delivery")
@@ -407,7 +982,11 @@ func newCompatiblePrePRFixtureMode(t *testing.T, deliveryPath, basePath string, 
 			PolicyArtifact: policyPath, LedgerArtifact: ledgerPath, EvidenceArtifact: evidencePath,
 		},
 	}
-	fixture.request.PrePR = &PrePRRequest{CIAttestationArtifact: fixture.attestationPath}
+	target, prePR, err := buildPrePRTarget(context.Background(), repo, "", fixture.attestationPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.request.Target, fixture.request.PrePR = target, prePR
 	bindGateRequestToStore(t, &fixture.request, store)
 	fixture.signAndWriteAttestation(t)
 	return fixture
@@ -432,8 +1011,12 @@ func (fixture *compatiblePrePRFixture) writeAttestation(t *testing.T) {
 
 func TestBuildNativeGateRequestDerivesAuthorityForEveryGate(t *testing.T) {
 	repo := initSnapshotRepo(t)
+	branch := currentBranch(context.Background(), repo)
 	gitSnapshot(t, repo, "branch", "main", "HEAD")
 	configurePublicationRemote(t, repo, "main")
+	gitSnapshot(t, repo, "config", "branch."+branch+".remote", "origin")
+	gitSnapshot(t, repo, "config", "branch."+branch+".merge", "refs/heads/main")
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
 	tx, _, fixture := nativeGateFixture(t, repo, "native-request-all-gates")
 	store, err := AuthoritativeStore(context.Background(), repo, tx.LineageID)
 	if err != nil {
@@ -464,8 +1047,10 @@ func TestBuildNativeGateRequestDerivesAuthorityForEveryGate(t *testing.T) {
 				t.Fatalf("pre-commit target = %#v", request.Target)
 			}
 		}},
-		{gate: GatePrePush, assert: func(t *testing.T, request GateRequest) {
-			if request.Target.Kind != TargetExactRevision || request.Target.Revision == "" {
+		{gate: GatePrePush, prepare: func(*NativeGateRequestInput) {
+			gitSnapshot(t, repo, "commit", "-am", "delivery")
+		}, assert: func(t *testing.T, request GateRequest) {
+			if request.Target.Kind != TargetBaseDiff || request.Target.BaseRef == "" || request.Push == nil {
 				t.Fatalf("pre-push target = %#v", request.Target)
 			}
 		}},
@@ -653,13 +1238,14 @@ func TestNativeGateRejectsHistoricalTargetAfterHeadAdvances(t *testing.T) {
 
 func TestNativePrePushGateAcceptsCommittedCurrentChangesReceipt(t *testing.T) {
 	repo, receipt, request := approvedCurrentChangesGateFixture(t, "pre-push-current-changes")
+	gitSnapshot(t, repo, "add", "--", "tracked.txt")
 	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateAllow {
 		t.Fatalf("EvaluateNativeGate(pre-commit current changes) = %#v", got)
 	}
 
 	gitSnapshot(t, repo, "add", "tracked.txt")
 	gitSnapshot(t, repo, "commit", "-m", "deliver reviewed current changes")
-	request.Gate = GatePrePush
+	request = nativePrePushRequest(t, repo, receipt, request)
 	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateAllow {
 		t.Fatalf("EvaluateNativeGate(pre-push committed current changes) = %#v", got)
 	}
@@ -692,7 +1278,7 @@ func TestNativePrePushGateRejectsChangedOrAdvancedHead(t *testing.T) {
 				gitSnapshot(t, repo, "add", "tracked.txt")
 				gitSnapshot(t, repo, "commit", "-m", "alter reviewed delivery")
 			},
-			want: GateScopeChanged,
+			want: GateInvalidated,
 		},
 		{
 			name:    "advanced head",
@@ -710,8 +1296,8 @@ func TestNativePrePushGateRejectsChangedOrAdvancedHead(t *testing.T) {
 			repo, receipt, request := approvedCurrentChangesGateFixture(t, tt.lineage)
 			gitSnapshot(t, repo, "add", "tracked.txt")
 			gitSnapshot(t, repo, "commit", "-m", "deliver reviewed current changes")
+			request = nativePrePushRequest(t, repo, receipt, request)
 			tt.advance(t, repo)
-			request.Gate = GatePrePush
 
 			if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != tt.want {
 				t.Fatalf("EvaluateNativeGate(%s) = %#v, want %q", tt.name, got, tt.want)
@@ -749,8 +1335,12 @@ func TestNativeGateUsesRetainedArtifactContentAndRejectsMismatch(t *testing.T) {
 
 func TestNativeGateFinalRecheckRejectsConcurrentRepositoryMutation(t *testing.T) {
 	repo, receipt, request := approvedCurrentChangesGateFixture(t, "final-recheck")
+	gitSnapshot(t, repo, "add", "--", "tracked.txt")
 	originalHook := finalGateAuthorizationHook
-	finalGateAuthorizationHook = func() { writeSnapshotFile(t, repo, "tracked.txt", "concurrent mutation\n") }
+	finalGateAuthorizationHook = func() {
+		writeSnapshotFile(t, repo, "tracked.txt", "concurrent mutation\n")
+		gitSnapshot(t, repo, "add", "--", "tracked.txt")
+	}
 	t.Cleanup(func() { finalGateAuthorizationHook = originalHook })
 
 	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateInvalidated || !strings.Contains(got.Reason, "changed during final authorization") {
@@ -760,6 +1350,7 @@ func TestNativeGateFinalRecheckRejectsConcurrentRepositoryMutation(t *testing.T)
 
 func TestNativeGateFinalRecheckRejectsConcurrentAuthorityMutation(t *testing.T) {
 	repo, receipt, request := approvedCurrentChangesGateFixture(t, "final-authority-recheck")
+	gitSnapshot(t, repo, "add", "--", "tracked.txt")
 	store, err := AuthoritativeStore(context.Background(), repo, receipt.LineageID)
 	if err != nil {
 		t.Fatal(err)
@@ -774,6 +1365,53 @@ func TestNativeGateFinalRecheckRejectsConcurrentAuthorityMutation(t *testing.T) 
 
 	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateInvalidated || !strings.Contains(got.Reason, "changed during final authorization") {
 		t.Fatalf("concurrent authority evaluation = %#v", got)
+	}
+}
+
+func TestLegacyPreCommitGateRejectsPartialTrackedIndex(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "a.txt", "base a\n")
+	writeSnapshotFile(t, repo, "b.txt", "base b\n")
+	gitSnapshot(t, repo, "add", "--", "a.txt", "b.txt")
+	gitSnapshot(t, repo, "commit", "-m", "add tracked files")
+	writeSnapshotFile(t, repo, "a.txt", "reviewed a\n")
+	writeSnapshotFile(t, repo, "b.txt", "reviewed b\n")
+	transaction, receipt, request := nativeGateFixture(t, repo, "legacy-partial-tracked-index")
+	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendApprovedStoreChain(t, store, transaction)
+	bindGateRequestToStore(t, &request, store)
+	request.Gate = GatePreCommit
+	gitSnapshot(t, repo, "add", "--", "a.txt")
+
+	got := EvaluateNativeGate(context.Background(), repo, receipt, request)
+	if got.Result != GateInvalidated || got.Reason != "current repository target cannot be derived: staged tree does not exactly match the complete reviewed candidate" {
+		t.Fatalf("partial tracked index result = %#v", got)
+	}
+}
+
+func TestLegacyPreCommitGateAllowsExactTrackedIndex(t *testing.T) {
+	repo := initSnapshotRepo(t)
+	writeSnapshotFile(t, repo, "a.txt", "base a\n")
+	writeSnapshotFile(t, repo, "b.txt", "base b\n")
+	gitSnapshot(t, repo, "add", "--", "a.txt", "b.txt")
+	gitSnapshot(t, repo, "commit", "-m", "add tracked files")
+	writeSnapshotFile(t, repo, "a.txt", "reviewed a\n")
+	writeSnapshotFile(t, repo, "b.txt", "reviewed b\n")
+	transaction, receipt, request := nativeGateFixture(t, repo, "legacy-exact-tracked-index")
+	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendApprovedStoreChain(t, store, transaction)
+	bindGateRequestToStore(t, &request, store)
+	request.Gate = GatePreCommit
+	gitSnapshot(t, repo, "add", "--", "a.txt", "b.txt")
+
+	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateAllow {
+		t.Fatalf("exact tracked index = %#v", got)
 	}
 }
 
@@ -905,6 +1543,13 @@ func nativeGateFixtureWithIntended(t *testing.T, repo, lineage string, intended 
 func approvedCurrentChangesGateFixture(t *testing.T, lineage string) (string, Receipt, GateRequest) {
 	t.Helper()
 	repo := initSnapshotRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	configurePublicationRemote(t, repo, branch)
+	gitSnapshot(t, repo, "config", "branch."+branch+".remote", "origin")
+	gitSnapshot(t, repo, "config", "branch."+branch+".merge", "refs/heads/"+branch)
+	writeSnapshotFile(t, repo, "historical.txt", "pre-existing branch work\n")
+	gitSnapshot(t, repo, "add", "historical.txt")
+	gitSnapshot(t, repo, "commit", "-m", "historical branch work")
 	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
 	transaction, receipt, request := nativeGateFixture(t, repo, lineage)
 	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
@@ -920,6 +1565,10 @@ func approvedCurrentChangesGateFixture(t *testing.T, lineage string) (string, Re
 func approvedEmptyCurrentChangesGateFixture(t *testing.T, lineage string) (string, Receipt, GateRequest) {
 	t.Helper()
 	repo := initSnapshotRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	configurePublicationRemote(t, repo, branch)
+	gitSnapshot(t, repo, "config", "branch."+branch+".remote", "origin")
+	gitSnapshot(t, repo, "config", "branch."+branch+".merge", "refs/heads/"+branch)
 	transaction, receipt, request := nativeGateFixture(t, repo, lineage)
 	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
 	if err != nil {
@@ -1042,4 +1691,294 @@ func bindGateRequestToStore(t *testing.T, request *GateRequest, store Store) {
 	request.GenesisRevision = bundle.GenesisRevision
 	request.ChainIdentity = bundle.ChainIdentity
 	request.BundleDigest = bundle.BundleDigest
+}
+
+func nativePrePushRequest(t *testing.T, repo string, receipt Receipt, artifacts GateRequest) GateRequest {
+	t.Helper()
+	input := NativeGateRequestInput{Gate: GatePrePush, LineageID: receipt.LineageID, PolicyArtifact: artifacts.PolicyArtifact, LedgerArtifact: artifacts.LedgerArtifact, EvidenceArtifact: artifacts.EvidenceArtifact}
+	request, err := BuildNativeGateRequest(context.Background(), repo, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request
+}
+
+func emptyRemoteTrackingRepo(t *testing.T) (string, string) {
+	t.Helper()
+	repo := initSnapshotRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	remote := filepath.Join(t.TempDir(), "empty-remote.git")
+	gitSnapshot(t, repo, "init", "--bare", remote)
+	gitSnapshot(t, repo, "remote", "add", "origin", remote)
+	gitSnapshot(t, repo, "config", "branch."+branch+".remote", "origin")
+	gitSnapshot(t, repo, "config", "branch."+branch+".merge", "refs/heads/"+branch)
+	return repo, remote
+}
+
+func TestBuildPushTargetBootstrapsFirstPublicationOnEmptyRemote(t *testing.T) {
+	repo, _ := emptyRemoteTrackingRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	reviewedBase := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	reviewedBaseTree := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}"))
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
+	gitSnapshot(t, repo, "commit", "-am", "reviewed delivery")
+
+	target, push, err := buildPushTarget(context.Background(), repo, "", reviewedBaseTree, "")
+	if err != nil {
+		t.Fatalf("buildPushTarget(empty remote) error = %v", err)
+	}
+	zero := strings.Repeat("0", len(reviewedBase))
+	if push.Boundary.Source != PrePRBoundaryEmptyRemoteBootstrap || push.Boundary.Commit != zero ||
+		push.Boundary.Remote != "origin" || push.Boundary.RemoteRef != "refs/heads/"+branch || push.Boundary.RemoteIdentity == "" {
+		t.Fatalf("bootstrap boundary = %#v", push.Boundary)
+	}
+	if push.MergeBase != zero || push.PushRemote != "origin" || push.PushRemoteIdentity != push.Boundary.RemoteIdentity {
+		t.Fatalf("bootstrap push request = %#v", push)
+	}
+	if target.BaseRef != reviewedBase {
+		t.Fatalf("bootstrap target base = %q, want reviewed base %q", target.BaseRef, reviewedBase)
+	}
+	_, refs, err := prePushTargetForRequest(context.Background(), repo, GateRequest{Gate: GatePrePush, Target: target, Push: push})
+	if err != nil || refs.TrackingPresent {
+		t.Fatalf("empty-remote tracking boundary = %#v, %v", refs, err)
+	}
+}
+
+func TestNativePrePushGateAllowsFirstPublicationToEmptyRemote(t *testing.T) {
+	repo, _ := emptyRemoteTrackingRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
+	transaction, receipt, artifacts := nativeGateFixture(t, repo, "empty-remote-first-publication")
+	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendApprovedStoreChain(t, store, transaction)
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "reviewed delivery")
+
+	request := nativePrePushRequest(t, repo, receipt, artifacts)
+	if request.Push == nil || request.Push.Boundary.Source != PrePRBoundaryEmptyRemoteBootstrap {
+		t.Fatalf("first-publication pre-push request = %#v", request.Push)
+	}
+	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateAllow {
+		t.Fatalf("first-publication pre-push gate = %#v", got)
+	}
+}
+
+func TestNativePrePushFirstPublicationRejectsUndisclosedAncestorPath(t *testing.T) {
+	repo, _ := emptyRemoteTrackingRepo(t)
+	writeSnapshotFile(t, repo, "secret.txt", "must never be published\n")
+	gitSnapshot(t, repo, "add", "secret.txt")
+	gitSnapshot(t, repo, "commit", "-m", "pre-base secret")
+	gitSnapshot(t, repo, "rm", "-q", "secret.txt")
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed base\n")
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "remove pre-base secret")
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
+	transaction, receipt, artifacts := nativeGateFixture(t, repo, "empty-remote-undisclosed-ancestor")
+	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendApprovedStoreChain(t, store, transaction)
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "reviewed delivery")
+
+	request := nativePrePushRequest(t, repo, receipt, artifacts)
+	if request.Push == nil || request.Push.Boundary.Source != PrePRBoundaryEmptyRemoteBootstrap {
+		t.Fatalf("undisclosed-ancestor pre-push request = %#v", request.Push)
+	}
+	got := EvaluateNativeGate(context.Background(), repo, receipt, request)
+	if got.Result == GateAllow || !strings.Contains(got.Reason, "not disclosed by the reviewed base tree") || !strings.Contains(got.Reason, "squash pre-publication history") {
+		t.Fatalf("native bootstrap with undisclosed ancestor path = %#v", got)
+	}
+}
+
+func TestNativePrePushFirstPublicationRejectsOverwrittenSecretBlob(t *testing.T) {
+	repo, _ := emptyRemoteTrackingRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "SECRET_API_KEY=sk-abc123\n")
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "pre-base secret revision")
+	writeSnapshotFile(t, repo, "tracked.txt", "hello\n")
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "overwrite secret before review")
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
+	transaction, receipt, artifacts := nativeGateFixture(t, repo, "empty-remote-overwritten-secret-blob")
+	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendApprovedStoreChain(t, store, transaction)
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "reviewed delivery")
+
+	request := nativePrePushRequest(t, repo, receipt, artifacts)
+	if request.Push == nil || request.Push.Boundary.Source != PrePRBoundaryEmptyRemoteBootstrap {
+		t.Fatalf("overwritten-secret pre-push request = %#v", request.Push)
+	}
+	got := EvaluateNativeGate(context.Background(), repo, receipt, request)
+	if got.Result == GateAllow || !strings.Contains(got.Reason, "publishes pre-base history blob") || !strings.Contains(got.Reason, "tracked.txt") || !strings.Contains(got.Reason, "squash pre-publication history") {
+		t.Fatalf("native bootstrap with overwritten secret blob = %#v", got)
+	}
+}
+
+func TestNativePrePushGateInvalidatesWhenEmptyRemoteGainsRefsDuringValidation(t *testing.T) {
+	repo, _ := emptyRemoteTrackingRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
+	transaction, receipt, artifacts := nativeGateFixture(t, repo, "empty-remote-drift")
+	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendApprovedStoreChain(t, store, transaction)
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "reviewed delivery")
+	request := nativePrePushRequest(t, repo, receipt, artifacts)
+
+	originalHook := finalGateAuthorizationHook
+	finalGateAuthorizationHook = func() {
+		finalGateAuthorizationHook = originalHook
+		gitSnapshot(t, repo, "push", "origin", "HEAD:refs/heads/"+branch)
+	}
+	t.Cleanup(func() { finalGateAuthorizationHook = originalHook })
+	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateInvalidated || !strings.Contains(got.Reason, "final authorization") {
+		t.Fatalf("remote bootstrap drift evaluation = %#v", got)
+	}
+}
+
+func TestBuildPushTargetEmptyRemoteBootstrapRequiresReviewedDeliveryBase(t *testing.T) {
+	repo, _ := emptyRemoteTrackingRepo(t)
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
+	gitSnapshot(t, repo, "commit", "-am", "reviewed delivery")
+	if _, _, err := buildPushTarget(context.Background(), repo, "", "", ""); err == nil || !strings.Contains(err.Error(), "reviewed base tree") {
+		t.Fatalf("bootstrap without reviewed base tree error = %v", err)
+	}
+}
+
+func TestBuildPushTargetKeepsFailingClosedWhenRemoteAdvertisesOnlyOtherRefs(t *testing.T) {
+	repo, _ := emptyRemoteTrackingRepo(t)
+	reviewedBaseTree := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}"))
+	gitSnapshot(t, repo, "push", "origin", "HEAD:refs/heads/other")
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
+	gitSnapshot(t, repo, "commit", "-am", "reviewed delivery")
+	if _, _, err := buildPushTarget(context.Background(), repo, "", reviewedBaseTree, ""); err == nil || !strings.Contains(err.Error(), "advertised remote branch") {
+		t.Fatalf("non-empty remote without tracked branch error = %v", err)
+	}
+}
+
+func TestBuildPushTargetKeepsFailingClosedOnUnrelatedAdvertisedHistory(t *testing.T) {
+	repo, _ := emptyRemoteTrackingRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	reviewedBaseTree := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}"))
+	gitSnapshot(t, repo, "checkout", "--orphan", "unrelated")
+	writeSnapshotFile(t, repo, "unrelated.txt", "unrelated\n")
+	gitSnapshot(t, repo, "add", "unrelated.txt")
+	gitSnapshot(t, repo, "commit", "-m", "unrelated")
+	gitSnapshot(t, repo, "push", "origin", "HEAD:refs/heads/"+branch)
+	gitSnapshot(t, repo, "checkout", branch)
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
+	gitSnapshot(t, repo, "commit", "-am", "reviewed delivery")
+	if _, _, err := buildPushTarget(context.Background(), repo, "", reviewedBaseTree, ""); err == nil || !strings.Contains(err.Error(), "0 merge bases") {
+		t.Fatalf("unrelated advertised history error = %v", err)
+	}
+}
+
+func TestBuildPushTargetEmptyRemoteBootstrapRequiresMatchingPushDestination(t *testing.T) {
+	repo, _ := emptyRemoteTrackingRepo(t)
+	branch := currentBranch(context.Background(), repo)
+	reviewedBaseTree := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}"))
+	other := filepath.Join(t.TempDir(), "other.git")
+	gitSnapshot(t, repo, "init", "--bare", other)
+	gitSnapshot(t, repo, "remote", "add", "publish", other)
+	gitSnapshot(t, repo, "config", "branch."+branch+".pushRemote", "publish")
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
+	gitSnapshot(t, repo, "commit", "-am", "reviewed delivery")
+	if _, _, err := buildPushTarget(context.Background(), repo, "", reviewedBaseTree, ""); err == nil || !strings.Contains(err.Error(), "bootstrap") {
+		t.Fatalf("mismatched bootstrap push destination error = %v", err)
+	}
+}
+
+func TestBuildPushTargetEmptyRemoteKeepsDetachedHeadFailClosed(t *testing.T) {
+	repo, _ := emptyRemoteTrackingRepo(t)
+	reviewedBaseTree := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}"))
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
+	gitSnapshot(t, repo, "commit", "-am", "reviewed delivery")
+	gitSnapshot(t, repo, "checkout", "--detach")
+	if _, _, err := buildPushTarget(context.Background(), repo, "", reviewedBaseTree, ""); err == nil || !strings.Contains(err.Error(), "--base-ref") {
+		t.Fatalf("detached HEAD with empty remote error = %v", err)
+	}
+}
+
+func TestValidGitTreeRejectsNullOID(t *testing.T) {
+	for _, value := range []string{strings.Repeat("0", 40), strings.Repeat("0", 64)} {
+		if validGitTree(value) {
+			t.Fatalf("validGitTree(%q) accepted the reserved null OID", value)
+		}
+	}
+	if !validGitTree(strings.Repeat("0", 39) + "1") {
+		t.Fatal("validGitTree rejected a valid non-null object ID")
+	}
+}
+
+func TestBuildPushTargetEmptyRemoteRejectsAmbiguousReviewedDeliveryBase(t *testing.T) {
+	repo, _ := emptyRemoteTrackingRepo(t)
+	reviewedBaseTree := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD^{tree}"))
+	writeSnapshotFile(t, repo, "tracked.txt", "temporary change\n")
+	gitSnapshot(t, repo, "commit", "-am", "temporary change")
+	gitSnapshot(t, repo, "revert", "--no-edit", "HEAD")
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
+	gitSnapshot(t, repo, "commit", "-am", "reviewed delivery")
+	if _, _, err := buildPushTarget(context.Background(), repo, "", reviewedBaseTree, ""); err == nil || !strings.Contains(err.Error(), "missing or ambiguous") {
+		t.Fatalf("ambiguous reviewed delivery base error = %v", err)
+	}
+}
+
+// TestBootstrapDisclosureScopeExcludesCommitMetadata pins the documented
+// contract boundary of bootstrap ancestry disclosure: review authority covers
+// repository CONTENT — tracked paths and blob bytes — and never commit or tag
+// metadata. A pre-base commit created with `git commit --allow-empty` touches
+// zero paths and introduces zero blobs, so it passes both disclosure rules
+// even though its commit OBJECT — including the secret message below — is
+// transferred by the bootstrap push. Commit messages are not review-bound
+// anywhere in the gate model: an ordinary (non-bootstrap) pre-push equally
+// publishes the reviewed delivery commit's message without any receipt
+// binding it, so bootstrap widens no guarantee that ever existed (see the
+// validateBootstrapAncestryDisclosure doc). Any future change that intends
+// to close this boundary must consciously flip this test.
+func TestBootstrapDisclosureScopeExcludesCommitMetadata(t *testing.T) {
+	repo, _ := emptyRemoteTrackingRepo(t)
+	gitSnapshot(t, repo, "commit", "--allow-empty", "-m", "SECRET-COMMIT-MESSAGE-MARKER token=hunter2")
+	secretCommit := trimGit(gitSnapshot(t, repo, "rev-parse", "HEAD"))
+	gitSnapshot(t, repo, "tag", "-a", "-m", "SECRET-TAG-MESSAGE-MARKER", "pre-base-secret")
+	writeSnapshotFile(t, repo, "reviewed-base.txt", "reviewed base\n")
+	gitSnapshot(t, repo, "add", "reviewed-base.txt")
+	gitSnapshot(t, repo, "commit", "-m", "reviewed base")
+	writeSnapshotFile(t, repo, "tracked.txt", "reviewed delivery\n")
+	transaction, receipt, artifacts := nativeGateFixture(t, repo, "bootstrap-commit-metadata-scope")
+	store, err := AuthoritativeStore(context.Background(), repo, transaction.LineageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendApprovedStoreChain(t, store, transaction)
+	gitSnapshot(t, repo, "add", "tracked.txt")
+	gitSnapshot(t, repo, "commit", "-m", "reviewed delivery")
+
+	request := nativePrePushRequest(t, repo, receipt, artifacts)
+	if request.Push == nil || request.Push.Boundary.Source != PrePRBoundaryEmptyRemoteBootstrap {
+		t.Fatalf("commit-metadata scope pre-push request = %#v", request.Push)
+	}
+	if got := EvaluateNativeGate(context.Background(), repo, receipt, request); got.Result != GateAllow {
+		t.Fatalf("bootstrap with secret pre-base commit message = %#v", got)
+	}
+	if !strings.Contains(gitSnapshot(t, repo, "rev-list", "HEAD"), secretCommit) {
+		t.Fatal("secret pre-base commit is not part of the published history")
+	}
+	// Annotated tag objects point AT commits; nothing reachable from a
+	// commit points back at a tag, so a branch bootstrap push transfers no
+	// tag objects and therefore no tag messages.
+	tagObject := trimGit(gitSnapshot(t, repo, "rev-parse", "pre-base-secret"))
+	if strings.Contains(gitSnapshot(t, repo, "rev-list", "--objects", "HEAD"), tagObject) {
+		t.Fatal("annotated tag object is reachable from the published history")
+	}
 }

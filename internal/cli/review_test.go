@@ -53,6 +53,7 @@ func TestLegacyV1ResumeValidateExportImportRemainUsable(t *testing.T) {
 		t.Fatalf("legacy resume result = %#v, %v", resumed, err)
 	}
 	output.Reset()
+	runReviewCLIGit(t, fixture.repo, "add", "tracked.txt")
 	if err := RunReviewValidate([]string{
 		"--cwd", fixture.repo, "--receipt", fixture.receiptPath,
 		"--lineage", fixture.lineage, "--gate", string(reviewtransaction.GatePreCommit),
@@ -88,6 +89,7 @@ func TestLegacyV1ResumeValidateExportImportRemainUsable(t *testing.T) {
 	request.BundleDigest = bundle.BundleDigest
 	requestPath := filepath.Join(t.TempDir(), "request.json")
 	writeReviewCLIJSON(t, requestPath, request)
+	runReviewCLIGit(t, fixture.repo, "branch", "reviewed-base", "HEAD^")
 	clone := filepath.Join(t.TempDir(), "clone")
 	runReviewCLIGit(t, fixture.repo, "clone", "--no-local", fixture.repo, clone)
 	if err := RunReviewBundleImport([]string{
@@ -101,7 +103,7 @@ func TestLegacyV1ResumeValidateExportImportRemainUsable(t *testing.T) {
 	output.Reset()
 	if err := RunReviewValidate([]string{
 		"--cwd", clone, "--receipt", fixture.receiptPath,
-		"--lineage", fixture.lineage, "--gate", string(reviewtransaction.GatePrePush),
+		"--lineage", fixture.lineage, "--gate", string(reviewtransaction.GatePrePush), "--base-ref", "origin/reviewed-base",
 	}, &output); err != nil {
 		t.Fatalf("imported legacy validate: %v\n%s", err, output.String())
 	}
@@ -148,6 +150,7 @@ func TestLegacyV1MutationCommandsRejectWithoutChangingHead(t *testing.T) {
 
 func TestLegacyV1ExplicitAndNativeValidationRemainEquivalent(t *testing.T) {
 	fixture := newLegacyCLIFixture(t, "legacy-gate-parity")
+	runReviewCLIGit(t, fixture.repo, "add", "tracked.txt")
 	request, err := reviewtransaction.BuildNativeGateRequest(context.Background(), fixture.repo, reviewtransaction.NativeGateRequestInput{
 		Gate: reviewtransaction.GatePreCommit, LineageID: fixture.lineage,
 	})
@@ -200,6 +203,29 @@ func TestReviewSubcommandHelpLabelsLegacyMutationReadOnly(t *testing.T) {
 	}
 }
 
+func TestReviewGateActionScopeChangedRequiresExplicitMaintainerAction(t *testing.T) {
+	for _, tt := range []struct {
+		result reviewtransaction.GateResult
+		want   string
+	}{
+		{reviewtransaction.GateAllow, "continue"},
+		{reviewtransaction.GateScopeChanged, "explicit-maintainer-action"},
+		{reviewtransaction.GateInvalidated, "explicit-maintainer-action"},
+		{reviewtransaction.GateEscalated, "stop"},
+	} {
+		t.Run(string(tt.result), func(t *testing.T) {
+			result := ReviewValidateResult{Result: tt.result, Allowed: tt.result == reviewtransaction.GateAllow, Action: reviewGateAction(tt.result)}
+			payload, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Action != tt.want || result.Allowed != (tt.result == reviewtransaction.GateAllow) || strings.Contains(string(payload), "create-new-lineage") {
+				t.Fatalf("gate result = %s", payload)
+			}
+		})
+	}
+}
+
 type legacyCLIFixture struct {
 	repo, lineage, policyPath, ledgerPath, evidencePath, receiptPath string
 	store                                                            reviewtransaction.Store
@@ -209,6 +235,8 @@ type legacyCLIFixture struct {
 func newLegacyCLIFixture(t *testing.T, lineage string) legacyCLIFixture {
 	t.Helper()
 	repo := initReviewCLIRepo(t)
+	branch := strings.TrimSpace(runReviewCLIGit(t, repo, "symbolic-ref", "--short", "HEAD"))
+	configureCLIReviewPublicationRemote(t, repo, branch)
 	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("candidate\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +258,7 @@ func newLegacyCLIFixture(t *testing.T, lineage string) legacyCLIFixture {
 		t.Fatal(err)
 	}
 	snapshot, err := (reviewtransaction.SnapshotBuilder{Repo: repo}).Build(context.Background(), reviewtransaction.Target{
-		Kind: reviewtransaction.TargetCurrentChanges, IntendedUntracked: []string{},
+		Kind: reviewtransaction.TargetCurrentChanges, Projection: reviewtransaction.ProjectionWorkspace, IntendedUntracked: []string{},
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -3,8 +3,7 @@ package upgrade
 import (
 	"context"
 	"errors"
-	"github.com/gentleman-programming/gentle-ai/internal/system"
-	"github.com/gentleman-programming/gentle-ai/internal/update"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +12,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/gentleman-programming/gentle-ai/internal/system"
+	"github.com/gentleman-programming/gentle-ai/internal/update"
 )
 
 func TestMain(m *testing.M) {
@@ -267,40 +269,25 @@ func TestRunStrategy_GoInstallFailure(t *testing.T) {
 	}
 }
 
-// --- TestEffectiveMethod_GentleAIOnWindowsUsesInstaller ---
-
-// TestEffectiveMethod_GentleAIOnWindowsUsesInstaller verifies that gentle-ai
-// on Windows uses InstallInstaller (auto-upgrade via PowerShell)
-func TestEffectiveMethod_GentleAIOnWindowsUsesInstaller(t *testing.T) {
+// TestEffectiveMethodGentleAIOnWindowsUsesFailClosedBinaryPolicy verifies that
+// Windows never routes gentle-ai through a remote installer or an automatic
+// go-install path that may target a different binary location.
+func TestEffectiveMethodGentleAIOnWindowsUsesFailClosedBinaryPolicy(t *testing.T) {
 	tests := []struct {
 		name string
 		tool update.ToolInfo
-		want update.InstallMethod
 	}{
 		{
-			name: "binary becomes installer",
+			name: "binary remains policy boundary",
 			tool: update.ToolInfo{Name: "gentle-ai", InstallMethod: update.InstallBinary},
-			want: update.InstallInstaller,
 		},
 		{
-			name: "script becomes installer",
+			name: "legacy script declaration is disabled",
 			tool: update.ToolInfo{Name: "gentle-ai", InstallMethod: update.InstallScript},
-			want: update.InstallInstaller,
 		},
 		{
-			name: "go-install becomes installer",
-			tool: update.ToolInfo{Name: "gentle-ai", InstallMethod: update.InstallGoInstall},
-			want: update.InstallInstaller,
-		},
-		{
-			name: "installer stays installer",
-			tool: update.ToolInfo{Name: "gentle-ai", InstallMethod: update.InstallInstaller},
-			want: update.InstallInstaller,
-		},
-		{
-			name: "go available still uses installer",
+			name: "Go availability still requires an explicit source install",
 			tool: update.ToolInfo{Name: "gentle-ai", InstallMethod: update.InstallBinary, GoImportPath: "github.com/Gentleman-Programming/gentle-ai/cmd/gentle-ai"},
-			want: update.InstallInstaller,
 		},
 	}
 
@@ -308,8 +295,8 @@ func TestEffectiveMethod_GentleAIOnWindowsUsesInstaller(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			profile := system.PlatformProfile{OS: "windows", PackageManager: "winget", GoAvailable: true}
 			method := effectiveMethod(tc.tool, profile)
-			if method != tc.want {
-				t.Errorf("effectiveMethod(%q) = %q, want %q", tc.tool.Name, method, tc.want)
+			if method != update.InstallBinary {
+				t.Errorf("effectiveMethod(%q) = %q, want %q", tc.tool.Name, method, update.InstallBinary)
 			}
 		})
 	}
@@ -319,7 +306,7 @@ func TestEffectiveMethod_GentleAIOnWindowsUsesInstaller(t *testing.T) {
 
 // TestEffectiveMethod_NonGentleAIToolsOnWindowsUseBinary verifies that tools
 // OTHER than gentle-ai on Windows still use their declared install method
-// (binary, script, etc.) - they don't get InstallInstaller.
+// (binary, script, etc.).
 func TestEffectiveMethod_NonGentleAIToolsOnWindowsUseBinary(t *testing.T) {
 	tests := []struct {
 		name string
@@ -690,6 +677,153 @@ func TestRunStrategyOpenCodePluginRegisteredPendingRunsPackageManager(t *testing
 	}
 }
 
+func TestRunStrategyOpenCodePluginNpmERESOLVERetriesWithLegacyPeerDeps(t *testing.T) {
+	var callHistory [][]string
+	configureOpenCodeNpmTest(t, func(name string, args ...string) *exec.Cmd {
+		callHistory = append(callHistory, append([]string{name}, args...))
+		if len(callHistory) == 1 {
+			return failingCmd("npm error code ERESOLVE\nnpm error ERESOLVE could not resolve")
+		}
+		return mockCmd("true")
+	})
+
+	readStderr, writeStderr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = writeStderr
+	t.Cleanup(func() { os.Stderr = origStderr })
+
+	_, upgradeErr := runStrategy(context.Background(), openCodePluginUpdateResult("opencode-sdd-engram-manage"), system.PlatformProfile{})
+	os.Stderr = origStderr
+	if err := writeStderr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	warning, err := io.ReadAll(readStderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := readStderr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if upgradeErr != nil {
+		t.Fatalf("unexpected error on retry: %v", upgradeErr)
+	}
+	if !strings.Contains(string(warning), "WARNING:") || !strings.Contains(string(warning), "--legacy-peer-deps") {
+		t.Fatalf("stderr = %q, want visible legacy peer dependency warning", warning)
+	}
+	if len(callHistory) != 2 {
+		t.Fatalf("expected 2 exec calls (initial + retry), got %d", len(callHistory))
+	}
+	wantRetry := []string{"npm", "install", "--save", "--no-audit", "--no-fund", "--legacy-peer-deps", "opencode-sdd-engram-manage@latest", "@opencode-ai/plugin@latest"}
+	if strings.Join(callHistory[1], " ") != strings.Join(wantRetry, " ") {
+		t.Fatalf("retry command = %v, want %v", callHistory[1], wantRetry)
+	}
+}
+
+func TestRunStrategyOpenCodePluginNpmERESOLVERetryFailurePreservesBothErrors(t *testing.T) {
+	configureOpenCodeNpmTest(t, func(name string, args ...string) *exec.Cmd {
+		if slicesContain(args, "--legacy-peer-deps") {
+			return failingCmd("retry failed")
+		}
+		return failingCmd("npm error code ERESOLVE\noriginal conflict")
+	})
+
+	_, err := runStrategy(context.Background(), openCodePluginUpdateResult("opencode-sdd-engram-manage"), system.PlatformProfile{})
+	if err == nil {
+		t.Fatal("expected retry failure")
+	}
+	for _, want := range []string{"retry failed", "original conflict", "original error", "retry with --legacy-peer-deps failed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func TestRunStrategyOpenCodePluginNpmNonERESOLVEDoesNotRetry(t *testing.T) {
+	calls := 0
+	configureOpenCodeNpmTest(t, func(name string, args ...string) *exec.Cmd {
+		calls++
+		return failingCmd("npm error package code ERESOLVE helper failed")
+	})
+
+	_, err := runStrategy(context.Background(), openCodePluginUpdateResult("opencode-sdd-engram-manage"), system.PlatformProfile{})
+	if err == nil {
+		t.Fatal("expected npm failure")
+	}
+	if calls != 1 {
+		t.Fatalf("exec calls = %d, want 1 without retry", calls)
+	}
+}
+
+func TestRunStrategyOpenCodePluginNpmERESOLVEDoesNotRetryAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var callHistory [][]string
+	configureOpenCodeNpmTest(t, func(name string, args ...string) *exec.Cmd {
+		callHistory = append(callHistory, append([]string{name}, args...))
+		cancel()
+		return failingCmd("npm error code ERESOLVE")
+	})
+
+	_, err := runStrategy(ctx, openCodePluginUpdateResult("opencode-sdd-engram-manage"), system.PlatformProfile{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if len(callHistory) != 1 {
+		t.Fatalf("exec calls = %d, want 1 without retry", len(callHistory))
+	}
+	if slicesContain(callHistory[0], "--legacy-peer-deps") {
+		t.Fatalf("initial command unexpectedly includes --legacy-peer-deps: %v", callHistory[0])
+	}
+}
+
+func configureOpenCodeNpmTest(t *testing.T, command func(string, ...string) *exec.Cmd) {
+	t.Helper()
+	origHomeDir, origLookPath, origExecCommand := openCodeHomeDir, lookPathCommand, execCommand
+	t.Cleanup(func() {
+		openCodeHomeDir, lookPathCommand, execCommand = origHomeDir, origLookPath, origExecCommand
+	})
+	home := t.TempDir()
+	opencodeDir := filepath.Join(home, ".config", "opencode")
+	if err := os.MkdirAll(opencodeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(opencodeDir, "tui.json"), []byte(`{"plugin":["opencode-sdd-engram-manage"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	openCodeHomeDir = func() (string, error) { return home, nil }
+	lookPathCommand = func(file string) (string, error) {
+		if file == "npm" {
+			return file, nil
+		}
+		return "", errors.New("not found")
+	}
+	execCommand = command
+}
+
+func openCodePluginUpdateResult(pkg string) update.UpdateResult {
+	return update.UpdateResult{Tool: update.ToolInfo{Name: pkg, InstallMethod: update.InstallOpenCodePlugin, NpmPackage: pkg}, Status: update.RegisteredNotMaterialized}
+}
+
+func slicesContain(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func failingCmd(output string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return exec.Command("cmd", "/c", "echo "+strings.ReplaceAll(output, "\n", " & echo ")+" & exit /b 1")
+	}
+	return exec.Command("sh", "-c", "printf '%s\\n' \"$1\"; exit 1", "sh", output)
+}
+
 func TestRunStrategyOpenCodePluginFallsBackWithoutPackageManager(t *testing.T) {
 	origHomeDir := openCodeHomeDir
 	origLookPath := lookPathCommand
@@ -774,16 +908,6 @@ func TestOpenCodePluginUpgradeHelperProcess(t *testing.T) {
 	}
 	os.Exit(0)
 }
-
-// --- TestManualFallbackHint ---
-//
-// Removed: TestManualFallbackHint previously verified that Windows binary
-// self-replace for gentle-ai returns a manual fallback error. The Windows
-// installer method (PR #257) now routes gentle-ai to installerUpgrade, which
-// downloads and launches the PowerShell installer. The manual-fallback path
-// remains exercised by binaryUpgrade for non-gentle-ai tools on Windows
-// (see TestRunStrategy_UnsupportedMethodManualFallback and
-// TestRunStrategy_ScriptUpgradeWindowsManualFallback).
 
 func containsAny(s string, subs ...string) bool {
 	for _, sub := range subs {
@@ -1549,354 +1673,6 @@ func TestRunStrategy_ScriptUpgradeExecFailure(t *testing.T) {
 	}
 }
 
-// --- TestInstallerUpgradeArgs ---
-
-// TestInstallerUpgradeArgs verifies that installerUpgradeArgs builds the correct
-// PowerShell command-line argument list for both stable and beta gentle-ai upgrades.
-// This is a pure function test — no OS gate needed.
-func TestInstallerUpgradeArgs(t *testing.T) {
-	const tmpPath = `C:\Users\user\AppData\Local\Temp\gentle-ai-install-12345.ps1`
-
-	tests := []struct {
-		name         string
-		beta         bool
-		wantContains []string
-		wantAbsent   []string
-	}{
-		{
-			name: "stable upgrade does not include -Channel beta",
-			beta: false,
-			wantContains: []string{
-				"-NoProfile",
-				"-NoExit",
-				"-ExecutionPolicy", "Bypass",
-				"-File", tmpPath,
-			},
-			wantAbsent: []string{"-Channel", "beta"},
-		},
-		{
-			name: "beta upgrade includes -Channel beta after -File",
-			beta: true,
-			wantContains: []string{
-				"-NoProfile",
-				"-NoExit",
-				"-ExecutionPolicy", "Bypass",
-				"-File", tmpPath,
-				"-Channel", "beta",
-			},
-			wantAbsent: nil,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			args := installerUpgradeArgs(tmpPath, tc.beta)
-
-			for _, want := range tc.wantContains {
-				found := false
-				for _, a := range args {
-					if a == want {
-						found = true
-						break
-					}
-				}
-				if !found {
-					t.Errorf("installerUpgradeArgs(beta=%v): args %v missing expected %q", tc.beta, args, want)
-				}
-			}
-
-			for _, absent := range tc.wantAbsent {
-				for _, a := range args {
-					if a == absent {
-						t.Errorf("installerUpgradeArgs(beta=%v): args %v must NOT contain %q", tc.beta, args, absent)
-					}
-				}
-			}
-
-			// For beta, assert -Channel beta appears AFTER -File tmpPath.
-			if tc.beta {
-				fileIdx := -1
-				channelIdx := -1
-				for i, a := range args {
-					if a == "-File" {
-						fileIdx = i
-					}
-					if a == "-Channel" {
-						channelIdx = i
-					}
-				}
-				if fileIdx < 0 {
-					t.Fatal("beta args: -File not found")
-				}
-				if channelIdx < 0 {
-					t.Fatal("beta args: -Channel not found")
-				}
-				if channelIdx <= fileIdx {
-					t.Errorf("beta args: -Channel (idx=%d) must come after -File (idx=%d); args: %v", channelIdx, fileIdx, args)
-				}
-				// Confirm the value after -Channel is "beta".
-				if channelIdx+1 >= len(args) || args[channelIdx+1] != "beta" {
-					t.Errorf("beta args: arg after -Channel must be %q, got args[%d]=%q; args: %v", "beta", channelIdx+1, args[channelIdx+1], args)
-				}
-			}
-		})
-	}
-}
-
-// TestRunStrategy_BetaGentleAIWindowsInstallerIncludesChannelBeta verifies the
-// full runStrategy path: on Windows, a beta gentle-ai upgrade via InstallInstaller
-// must pass -Channel beta to the PowerShell installer command.
-// Because installerUpgrade calls runtime.GOOS and skips on non-Windows, this
-// test verifies the behavior indirectly by asserting on the captured execCommand
-// args, which is only reachable on Windows. On non-Windows, the test is skipped.
-func TestRunStrategy_BetaGentleAIWindowsInstallerIncludesChannelBeta(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("skipping Windows-only installer beta channel test on non-windows platform")
-	}
-
-	origExecCommand := execCommand
-	origHTTPClient := scriptHTTPClient
-	t.Cleanup(func() {
-		execCommand = origExecCommand
-		scriptHTTPClient = origHTTPClient
-	})
-
-	scriptHTTPClient = &http.Client{
-		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			rec := httptest.NewRecorder()
-			rec.Header().Set("Content-Type", "text/plain")
-			rec.WriteHeader(http.StatusOK)
-			rec.WriteString("Write-Output 'installer ok'\n")
-			return rec.Result(), nil
-		}),
-	}
-
-	var gotArgs []string
-	execCommand = func(name string, args ...string) *exec.Cmd {
-		gotArgs = append([]string(nil), args...)
-		return mockCmd("echo", "ok")
-	}
-
-	r := update.UpdateResult{
-		Tool: update.ToolInfo{
-			Name:          "gentle-ai",
-			Owner:         "Gentleman-Programming",
-			Repo:          "gentle-ai",
-			InstallMethod: update.InstallInstaller,
-		},
-		LatestVersion: "main@abc1234",
-		Status:        update.UpdateAvailable,
-	}
-	profile := system.PlatformProfile{OS: "windows", PackageManager: "winget", Supported: true}
-
-	_, err := runStrategy(context.Background(), r, profile)
-	if err != nil {
-		t.Fatalf("runStrategy beta gentle-ai windows: unexpected error: %v", err)
-	}
-
-	// Verify -Channel beta is in the args passed to powershell.
-	foundChannel := false
-	for i, a := range gotArgs {
-		if a == "-Channel" && i+1 < len(gotArgs) && gotArgs[i+1] == "beta" {
-			foundChannel = true
-			break
-		}
-	}
-	if !foundChannel {
-		t.Errorf("runStrategy beta gentle-ai on Windows: execCommand args %v must include -Channel beta", gotArgs)
-	}
-}
-
-// TestRunStrategy_StableGentleAIWindowsInstallerExcludesChannelBeta verifies that
-// a stable (non-beta) gentle-ai upgrade on Windows does NOT pass -Channel beta.
-func TestRunStrategy_StableGentleAIWindowsInstallerExcludesChannelBeta(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("skipping Windows-only installer stable channel test on non-windows platform")
-	}
-
-	origExecCommand := execCommand
-	origHTTPClient := scriptHTTPClient
-	t.Cleanup(func() {
-		execCommand = origExecCommand
-		scriptHTTPClient = origHTTPClient
-	})
-
-	scriptHTTPClient = &http.Client{
-		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			rec := httptest.NewRecorder()
-			rec.Header().Set("Content-Type", "text/plain")
-			rec.WriteHeader(http.StatusOK)
-			rec.WriteString("Write-Output 'installer ok'\n")
-			return rec.Result(), nil
-		}),
-	}
-
-	var gotArgs []string
-	execCommand = func(name string, args ...string) *exec.Cmd {
-		gotArgs = append([]string(nil), args...)
-		return mockCmd("echo", "ok")
-	}
-
-	r := update.UpdateResult{
-		Tool: update.ToolInfo{
-			Name:          "gentle-ai",
-			Owner:         "Gentleman-Programming",
-			Repo:          "gentle-ai",
-			InstallMethod: update.InstallInstaller,
-		},
-		LatestVersion: "1.40.2",
-		Status:        update.UpdateAvailable,
-	}
-	profile := system.PlatformProfile{OS: "windows", PackageManager: "winget", Supported: true}
-
-	_, err := runStrategy(context.Background(), r, profile)
-	if err != nil {
-		t.Fatalf("runStrategy stable gentle-ai windows: unexpected error: %v", err)
-	}
-
-	for i, a := range gotArgs {
-		if a == "-Channel" {
-			val := ""
-			if i+1 < len(gotArgs) {
-				val = gotArgs[i+1]
-			}
-			t.Errorf("runStrategy stable gentle-ai on Windows: execCommand args must NOT include -Channel, got -Channel %q; all args: %v", val, gotArgs)
-		}
-	}
-}
-
-// --- TestInstallerUpgrade_Success ---
-
-func TestInstallerUpgrade_Success(t *testing.T) {
-	origExecCommand := execCommand
-	origHTTPClient := scriptHTTPClient
-	origGoos := runtime.GOOS
-	t.Cleanup(func() {
-		execCommand = origExecCommand
-		scriptHTTPClient = origHTTPClient
-	})
-
-	if origGoos != "windows" {
-		t.Skip("skipping Windows-only installer test on non-windows platform")
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Write-Output 'installer ok'\n"))
-	}))
-	defer server.Close()
-
-	scriptHTTPClient = server.Client()
-
-	execCalled := false
-	var gotArgs []string
-	execCommand = func(name string, args ...string) *exec.Cmd {
-		execCalled = true
-		gotArgs = append(gotArgs, args...)
-		return mockCmd("echo", "ok")
-	}
-
-	tool := update.ToolInfo{
-		Name:          "gentle-ai",
-		Owner:         "Gentleman-Programming",
-		Repo:          "gentle-ai",
-		InstallMethod: update.InstallInstaller,
-	}
-
-	// Change URL to use the local test server for the test.
-	// Since installerUpgrade constructs the URL directly, we mock the HTTP client and use a round tripper
-	// or we just trust the mock HTTP client will handle the request.
-	// Wait, installerUpgrade builds scriptURL := "https://raw.githubusercontent.com/...".
-	// The HTTP client needs to redirect this or respond directly.
-	// We'll create a custom RoundTripper so any URL returns our mock response.
-	scriptHTTPClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		rec := httptest.NewRecorder()
-		rec.Header().Set("Content-Type", "text/plain")
-		rec.WriteHeader(http.StatusOK)
-		rec.WriteString("Write-Output 'installer ok'\n")
-		return rec.Result(), nil
-	})
-
-	exitReq, err := installerUpgrade(context.Background(), tool, "", false)
-	if err != nil {
-		t.Fatalf("installerUpgrade: unexpected error: %v", err)
-	}
-
-	if !exitReq {
-		t.Errorf("expected exitReq to be true on success")
-	}
-	if !execCalled {
-		t.Errorf("expected execCommand to be called")
-	}
-
-	// Check if the temp file path is passed
-	filePassed := false
-	for i, arg := range gotArgs {
-		if arg == "-File" && i+1 < len(gotArgs) {
-			if strings.Contains(gotArgs[i+1], "gentle-ai-install") {
-				filePassed = true
-			}
-		}
-	}
-	if !filePassed {
-		t.Errorf("expected -File argument with temp file path, got args: %v", gotArgs)
-	}
-}
-
-// --- TestInstallerUpgrade_DownloadFailure ---
-
-func TestInstallerUpgrade_DownloadFailure(t *testing.T) {
-	origHTTPClient := scriptHTTPClient
-	origGoos := runtime.GOOS
-	t.Cleanup(func() {
-		scriptHTTPClient = origHTTPClient
-	})
-
-	if origGoos != "windows" {
-		t.Skip("skipping Windows-only installer test on non-windows platform")
-	}
-
-	scriptHTTPClient = &http.Client{
-		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-			rec := httptest.NewRecorder()
-			rec.WriteHeader(http.StatusNotFound)
-			return rec.Result(), nil
-		}),
-	}
-
-	tool := update.ToolInfo{
-		Name:          "gentle-ai",
-		Owner:         "Gentleman-Programming",
-		Repo:          "gentle-ai",
-		InstallMethod: update.InstallInstaller,
-	}
-
-	exitReq, err := installerUpgrade(context.Background(), tool, "", false)
-	if err == nil {
-		t.Errorf("expected error when installer download fails, got nil")
-	}
-	if exitReq {
-		t.Errorf("expected exitReq to be false on error")
-	}
-}
-
-// --- TestInstallerUpgrade_NonWindows ---
-
-func TestInstallerUpgrade_NonWindows(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("skipping non-Windows test on Windows platform")
-	}
-	tool := update.ToolInfo{Name: "gentle-ai"}
-	exitReq, err := installerUpgrade(context.Background(), tool, "", false)
-	if err == nil {
-		t.Errorf("expected error when calling installerUpgrade on non-windows, got nil")
-	}
-	if exitReq {
-		t.Errorf("expected exitReq to be false")
-	}
-}
-
 // --- TestEngramBinaryUpgrade_ChannelRouting (Slice 3) ---
 
 // TestEngramBinaryUpgrade_StableChannelCallsDownloadFn verifies that when
@@ -1980,10 +1756,4 @@ func TestEngramBinaryUpgrade_BetaChannelUsesGoInstallMain(t *testing.T) {
 	if !betaCalled {
 		t.Fatal("expected engramBetaInstallFn (beta path) to be called, but it was not")
 	}
-}
-
-type roundTripFunc func(req *http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
 }

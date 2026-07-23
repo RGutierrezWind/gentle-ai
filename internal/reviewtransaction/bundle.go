@@ -178,7 +178,7 @@ func validateChainBundle(bundle ChainBundle) (ValidatedChain, error) {
 		if records[index].PreviousRevision != revisions[index-1] {
 			return ValidatedChain{}, errors.New("review chain bundle predecessor is incomplete or reordered")
 		}
-		if err := validateSuccessor(records[index-1].Transaction, records[index].Transaction, records[index].Operation); err != nil {
+		if err := validatePersistedV1Successor(records[index-1].Transaction, records[index].Transaction, records[index].Operation, index); err != nil {
 			return ValidatedChain{}, fmt.Errorf("review chain bundle successor[%d]: %w", index, err)
 		}
 	}
@@ -242,10 +242,17 @@ func (store Store) installBundle(chain ValidatedChain, events []ChainBundleEvent
 	if strings.TrimSpace(store.Dir) == "" || len(events) != len(chain.Revisions) {
 		return ValidatedChain{}, errors.New("review bundle destination is invalid")
 	}
+	if store.maintenanceLockPath != "" {
+		maintenance, err := acquireMaintenanceLock(context.Background(), store.maintenanceLockPath, maintenanceShared)
+		if err != nil {
+			return ValidatedChain{}, err
+		}
+		defer maintenance.Release()
+	}
 	if err := os.MkdirAll(filepath.Join(store.Dir, "events"), 0o755); err != nil {
 		return ValidatedChain{}, err
 	}
-	lock, err := acquireStoreLock(filepath.Join(store.Dir, "LOCK"))
+	lock, err := acquireLocalStoreLock(filepath.Join(store.Dir, "LOCK"))
 	if err != nil {
 		return ValidatedChain{}, err
 	}
@@ -294,7 +301,7 @@ func installContentAddressedFile(path string, payload []byte) error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	if err := os.Link(tempPath, path); err != nil {
+	if err := publishNoReplace(tempPath, path); err != nil {
 		if !os.IsExist(err) {
 			return err
 		}
