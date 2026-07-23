@@ -144,6 +144,35 @@ func TestWriteCodexProfiles_Idempotent(t *testing.T) {
 	}
 }
 
+func TestWriteCodexProfiles_PreservesNestedModelKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sdd-strong.config.toml")
+	nested := "[metadata] # user settings\nmodel = \"nested-model\"\nmodel_reasoning_effort = \"nested-effort\"\n"
+	input := "model = \"old-root\"\nmodel_reasoning_effort = \"low\"\n\n" + nested
+	if err := os.WriteFile(path, []byte(input), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	assignments := []ProfileAssignment{
+		{Profile: "sdd-strong", Model: "gpt-5.5", ReasoningEffort: "high"},
+	}
+	if _, _, err := WriteCodexProfiles(dir, assignments); err != nil {
+		t.Fatalf("WriteCodexProfiles() error = %v", err)
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	text := string(content)
+	if !strings.Contains(text, `model = "gpt-5.5"`) || !strings.Contains(text, `model_reasoning_effort = "high"`) {
+		t.Fatalf("profile root assignments were not updated; got:\n%s", text)
+	}
+	if !strings.Contains(text, nested) {
+		t.Fatalf("nested model assignments changed; got:\n%s", text)
+	}
+}
+
 // TestWriteCodexProfiles_ReturnsChangedPathsOnFirstWrite asserts that the
 // returned changed flag is true and files slice has all 3 paths on first write.
 func TestWriteCodexProfiles_ReturnsChangedPathsOnFirstWrite(t *testing.T) {

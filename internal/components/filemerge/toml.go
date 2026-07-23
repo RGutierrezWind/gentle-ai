@@ -780,39 +780,81 @@ func hasTOMLKeyPathPrefix(path, prefix []string) bool {
 
 // UpsertTopLevelTOMLString inserts or replaces a top-level key = "value" pair
 // in TOML content. The key is placed before the first [section] header so it
-// remains a top-level (non-table) setting. Existing occurrences of the key are
-// removed before inserting the new value (idempotent).
+// remains a top-level (non-table) setting. Duplicate root assignments are
+// collapsed while same-name keys in tables and dotted keys remain untouched.
+// All unrelated content and line endings are preserved byte-for-byte.
 //
 // Ported from engram/internal/setup/setup.go.
 func UpsertTopLevelTOMLString(content, key, value string) string {
-	content = strings.ReplaceAll(content, "\r\n", "\n")
-	lines := strings.Split(content, "\n")
-	lineValue := fmt.Sprintf("%s = %q", key, value)
+	target, ok := parseTOMLKeyPath(key)
+	if !ok || len(target) != 1 {
+		return content
+	}
 
-	// Remove all existing occurrences of the key.
-	var cleaned []string
+	lineEnding := "\n"
+	if newline := strings.IndexByte(content, '\n'); newline > 0 && content[newline-1] == '\r' {
+		lineEnding = "\r\n"
+	}
+
+	lines := strings.SplitAfter(content, "\n")
+	cleaned := make([]string, 0, len(lines))
+	insertAt := -1
+	topLevel := true
+	var multilineQuote byte
+	arrayDepth := 0
+	removingValue := false
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, key+" ") || strings.HasPrefix(trimmed, key+"=") {
+		if topLevel && removingValue {
+			advanceTOMLLexicalState(line, &multilineQuote, &arrayDepth)
+			removingValue = multilineQuote != 0 || arrayDepth > 0
 			continue
+		}
+		if topLevel && arrayDepth > 0 {
+			advanceTOMLLexicalState(line, &multilineQuote, &arrayDepth)
+			cleaned = append(cleaned, line)
+			continue
+		}
+
+		insideMultiline := multilineQuote != 0
+		advanceTOMLMultilineState(line, &multilineQuote)
+		if topLevel && !insideMultiline {
+			code := tomlCodeBeforeComment(line)
+			if equals := tomlIndexOutsideQuotes(code, '='); equals != -1 {
+				keyPath, isAssignment := parseTOMLKeyPath(code[:equals])
+				if isAssignment && len(keyPath) == 1 && keyPath[0] == target[0] {
+					multilineQuote = 0
+					arrayDepth = 0
+					advanceTOMLLexicalState(line[equals+1:], &multilineQuote, &arrayDepth)
+					removingValue = multilineQuote != 0 || arrayDepth > 0
+					continue
+				}
+				if isAssignment && strings.HasPrefix(strings.TrimSpace(code[equals+1:]), "[") {
+					var valueMultiline byte
+					advanceTOMLLexicalState(line[equals+1:], &valueMultiline, &arrayDepth)
+					multilineQuote = valueMultiline
+				}
+			} else if _, isHeader := parseTOMLTableHeader(line); isHeader {
+				topLevel = false
+				insertAt = len(cleaned)
+			}
 		}
 		cleaned = append(cleaned, line)
 	}
-
-	// Find insertion point: before the first [section] header.
-	insertAt := len(cleaned)
-	for i, line := range cleaned {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			insertAt = i
-			break
-		}
+	if removingValue || multilineQuote != 0 || arrayDepth > 0 {
+		return content
+	}
+	if insertAt == -1 {
+		insertAt = len(cleaned)
 	}
 
-	var out []string
+	lineValue := fmt.Sprintf("%s = %q%s", key, value, lineEnding)
+	if insertAt > 0 && cleaned[insertAt-1] != "" && !strings.HasSuffix(cleaned[insertAt-1], "\n") {
+		lineValue = lineEnding + lineValue
+	}
+
+	out := make([]string, 0, len(cleaned)+1)
 	out = append(out, cleaned[:insertAt]...)
 	out = append(out, lineValue)
 	out = append(out, cleaned[insertAt:]...)
-
-	return strings.TrimSpace(strings.Join(out, "\n")) + "\n"
+	return strings.Join(out, "")
 }

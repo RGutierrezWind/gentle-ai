@@ -230,6 +230,92 @@ command = "engram"
 	}
 }
 
+func TestUpsertTopLevelTOMLString_PreservesScopeAndFormatting(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		key   string
+		value string
+		want  string
+	}{
+		{
+			name:  "collapse root duplicates without touching nested or dotted keys",
+			input: "model = \"old\"\n\"model\" = \"duplicate\" # replace\nmodel.variant = \"root-dotted\"\nmodel . variant = \"spaced-dotted\"\n\n[profile] # keep comment\nmodel = \"nested\" # preserve\n\n[[profiles]] # keep array comment\n'model' = \"array-nested\"\n",
+			key:   "model",
+			value: "new",
+			want:  "model.variant = \"root-dotted\"\nmodel . variant = \"spaced-dotted\"\n\nmodel = \"new\"\n[profile] # keep comment\nmodel = \"nested\" # preserve\n\n[[profiles]] # keep array comment\n'model' = \"array-nested\"\n",
+		},
+		{
+			name:  "preserve CRLF and unrelated outer whitespace",
+			input: "  # leading comment  \r\n'model'\t = \"old\" # replace\r\n\r\n[profile] # keep comment\r\n  model = \"nested\"  \r\n  ",
+			key:   "model",
+			value: "new",
+			want:  "  # leading comment  \r\n\r\nmodel = \"new\"\r\n[profile] # keep comment\r\n  model = \"nested\"  \r\n  ",
+		},
+		{
+			name:  "insert before array table with trailing comment",
+			input: "# preamble\n[[profiles]] # first profile\nmodel = \"nested\"\n",
+			key:   "model",
+			value: "new",
+			want:  "# preamble\nmodel = \"new\"\n[[profiles]] # first profile\nmodel = \"nested\"\n",
+		},
+		{
+			name:  "replace a multiline root value without parsing string contents",
+			input: "description = '''\n[not-a-table]\nmodel = \"string content\"\n'''\nmodel = \"\"\"\nold\nvalue\n\"\"\"\n[profile]\nmodel = \"nested\"\n",
+			key:   "model",
+			value: "new",
+			want:  "description = '''\n[not-a-table]\nmodel = \"string content\"\n'''\nmodel = \"new\"\n[profile]\nmodel = \"nested\"\n",
+		},
+		{
+			name:  "preserve input with unterminated multiline root string",
+			input: "model = \"\"\"\nold value\nunrelated = \"keep\"\n[profile]\nname = \"keep\"\n",
+			key:   "model",
+			value: "new",
+			want:  "model = \"\"\"\nold value\nunrelated = \"keep\"\n[profile]\nname = \"keep\"\n",
+		},
+		{
+			name:  "preserve input with unterminated multiline root array",
+			input: "model = [\n  \"old\",\nunrelated = \"keep\"\n[profile]\nname = \"keep\"\n",
+			key:   "model",
+			value: "new",
+			want:  "model = [\n  \"old\",\nunrelated = \"keep\"\n[profile]\nname = \"keep\"\n",
+		},
+		{
+			name:  "preserve input with unrelated unterminated multiline root string",
+			input: "description = \"\"\"\nold value\n",
+			key:   "model",
+			value: "new",
+			want:  "description = \"\"\"\nold value\n",
+		},
+		{
+			name:  "preserve input with unrelated unterminated multiline root array",
+			input: "features = [\n  \"one\",\n",
+			key:   "model",
+			value: "new",
+			want:  "features = [\n  \"one\",\n",
+		},
+		{
+			name:  "reject a dotted target key",
+			input: "model.variant = \"custom\"\n",
+			key:   "model.variant",
+			value: "new",
+			want:  "model.variant = \"custom\"\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := UpsertTopLevelTOMLString(tt.input, tt.key, tt.value)
+			if got != tt.want {
+				t.Fatalf("UpsertTopLevelTOMLString() = %q, want %q", got, tt.want)
+			}
+			if second := UpsertTopLevelTOMLString(got, tt.key, tt.value); second != got {
+				t.Fatalf("second UpsertTopLevelTOMLString() = %q, want unchanged %q", second, got)
+			}
+		})
+	}
+}
+
 // ─── UpsertCodexMCPServerBlock ────────────────────────────────────────────────
 
 func TestUpsertCodexMCPServerBlock_Empty(t *testing.T) {
