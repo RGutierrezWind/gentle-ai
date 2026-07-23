@@ -2419,6 +2419,38 @@ func TestModelConfigOpenCodeReloadsBaseAssignmentsAfterProfileEdit(t *testing.T)
 	}
 }
 
+func TestModelConfigOpenCodeSurfacesBaseAssignmentLoadErrorAfterProfileEdit(t *testing.T) {
+	originalReadCurrentAssignmentsFn := readCurrentAssignmentsFn
+	t.Cleanup(func() { readCurrentAssignmentsFn = originalReadCurrentAssignmentsFn })
+
+	readCurrentAssignmentsFn = func(string) (map[string]model.ModelAssignment, error) {
+		return nil, errors.New("invalid opencode.json")
+	}
+
+	m := NewModel(system.DetectionResult{}, "dev")
+	m.Screen = ScreenModelConfig
+	m.Cursor = 1
+	m.ProfileEditMode = true
+	m.ProfileDraft = model.Profile{Name: "work"}
+	m.Selection.ModelAssignments = map[string]model.ModelAssignment{
+		screens.SDDOrchestratorPhase: {ProviderID: "profile-provider", ModelID: "profile-orchestrator"},
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	state := updated.(Model)
+
+	if state.Selection.ModelAssignments != nil {
+		t.Fatalf("model assignments = %v, want nil after load failure", state.Selection.ModelAssignments)
+	}
+	if state.ProfileEditMode || !reflect.DeepEqual(state.ProfileDraft, model.Profile{}) {
+		t.Fatalf("profile context was not cleared: edit mode = %t, draft = %+v", state.ProfileEditMode, state.ProfileDraft)
+	}
+	const wantWarning = "Could not load current OpenCode model assignments: invalid opencode.json"
+	if state.ModelPicker.ConfigWarning != wantWarning {
+		t.Fatalf("config warning = %q, want %q", state.ModelPicker.ConfigWarning, wantWarning)
+	}
+}
+
 // TestModelConfig_BackNavigation verifies that selecting cursor 4 (Back) from
 // ScreenModelConfig returns to ScreenWelcome.
 // Index 3 is now "Configure Codex models"; Back moved to index 4.

@@ -172,7 +172,10 @@ func (m Model) hasProfileAssignmentContext() bool {
 func (m Model) withBaseOpenCodeModelAssignments() Model {
 	m.Selection.ModelAssignments = nil
 	settingsPath := opencode.DefaultSettingsPath()
-	if current, err := readCurrentAssignmentsFn(settingsPath); err == nil && len(current) > 0 {
+	current, err := readCurrentAssignmentsFn(settingsPath)
+	if err != nil {
+		m.ModelPicker.ConfigWarning = fmt.Sprintf("Could not load current OpenCode model assignments: %v", err)
+	} else if len(current) > 0 {
 		m.Selection.ModelAssignments = sanitizeKnownModelEfforts(current, m.ModelPicker.SDDModels)
 	}
 	return m
